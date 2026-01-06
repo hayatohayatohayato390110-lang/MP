@@ -1,0 +1,315 @@
+import os
+import glob
+import numpy as np
+import rasterio
+from rasterio.windows import Window
+from rasterio.enums import Resampling
+from sklearn.model_selection import train_test_split
+from sklearn.svm import SVC
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.preprocessing import StandardScaler
+import tensorflow as tf
+from tensorflow.keras.applications.inception_v3 import InceptionV3, preprocess_input
+import geopandas as gpd
+import gc
+
+# =========================================================================
+# 【設定】機能追加・高速化版
+# =========================================================================
+SAFE_PATH = r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20250202\S2B_MSIL2A_20250202T052939_N0511_R105_T43QEF_20250202T073729.SAFE"
+SHP_PATH = r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20250202\20250202.shp"
+OUTPUT_DIR = r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20250202"
+
+TILE_SIZE_PX = 10       # 元データ (10x10 pixel)
+TARGET_SIZE = 128       # AI入力用
+BATCH_SIZE = 32         
+PREDICT_BATCH_SIZE = 128
+STRIDE = 2              # 20m解像度相当で出力（高速化のため推奨）
+BLOCK_SIZE = 2048       
+# =========================================================================
+
+print("=== SVM Hybrid Analysis (Multi-Index & SWIR) Started ===")
+
+# GPU設定
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus: tf.config.experimental.set_memory_growth(gpu, True)
+        print("   -> GPU使用可能: 高速化モードON")
+    except RuntimeError as e: print(e)
+
+# --- 1. バンド検索 (SWIR追加) ---
+def find_band(safe_dir, band_str):
+    search_path = os.path.join(safe_dir, "**", f"*{band_str}*.jp2")
+    files = glob.glob(search_path, recursive=True)
+    files = [f for f in files if "TCI" not in f]
+    if not files: raise FileNotFoundError(f"Band {band_str} not found.")
+    return files[0]
+
+# 必須バンド
+path_b2  = find_band(SAFE_PATH, "_B02_") # Blue (10m)
+path_b3  = find_band(SAFE_PATH, "_B03_") # Green (10m)
+path_b4  = find_band(SAFE_PATH, "_B04_") # Red (10m)
+path_b8  = find_band(SAFE_PATH, "_B08_") # NIR (10m)
+path_b11 = find_band(SAFE_PATH, "_B11_") # SWIR1 (20m -> 要リサイズ)
+path_b12 = find_band(SAFE_PATH, "_B12_") # SWIR2 (20m -> 要リサイズ)
+
+print("   -> 全バンド特定完了 (SWIR含む)")
+
+# --- 2. モデル定義 (GPUリサイズ) ---
+base_inception = InceptionV3(weights='imagenet', include_top=False, pooling='avg', input_shape=(TARGET_SIZE, TARGET_SIZE, 3))
+
+@tf.function
+def extract_features_fast(images_raw):
+    # 10x10 -> 128x128 GPUリサイズ
+    images_resized = tf.image.resize(images_raw, [TARGET_SIZE, TARGET_SIZE], method='bilinear')
+    images_pre = preprocess_input(images_resized)
+    return base_inception(images_pre, training=False)
+
+# --- 3. 多様・高度な特徴量計算 (マニュアル特徴量) ---
+def calculate_indices(b2, b3, b4, b8, b11, b12):
+    # すべてfloat32に変換
+    v2  = b2.astype(np.float32)
+    v3  = b3.astype(np.float32)
+    v4  = b4.astype(np.float32)
+    v8  = b8.astype(np.float32)
+    v11 = b11.astype(np.float32)
+    v12 = b12.astype(np.float32)
+    
+    epsilon = 1e-6
+    
+    # --- 指標計算 (ご指定のリストに基づく) ---
+    
+    # 1. NDVI (植生)
+    ndvi = (v8 - v4) / (v8 + v4 + epsilon)
+    
+    # 2. NDWI (水/水分) - Gao (B8, B11) を採用（農業・水分量重視）
+    #    ※マクフィーターズ法(B3, B8)が必要な場合は (v3 - v8) / (v3 + v8 + epsilon) に変更可
+    ndwi = (v8 - v11) / (v8 + v11 + epsilon)
+    
+    # 3. NDBI (市街地/裸地) - SWIR活用
+    ndbi = (v11 - v8) / (v11 + v8 + epsilon)
+    
+    # 4. EVI (植生 - 高密度対応)
+    #    EVI = 2.5 * ((NIR - Red) / (NIR + 6*Red - 7.5*Blue + 1))
+    evi = 2.5 * ((v8 - v4) / (v8 + 6 * v4 - 7.5 * v2 + 10000 * 0.0001 + epsilon)) 
+    # ※Sentinel-2のDN値(0-10000)の場合、定数1はスケーリングに注意が必要ですが、ここでは相対値として簡易計算します
+    
+    # 5. BSI (裸地指数)
+    #    BSI = ((SWIR1 + Red) - (NIR + Blue)) / ((SWIR1 + Red) + (NIR + Blue))
+    bsi = ((v11 + v4) - (v8 + v2)) / ((v11 + v4) + (v8 + v2 + epsilon))
+    
+    # 中心ピクセルの値のみ取得 (計算コスト削減)
+    # TextureはInceptionV3が担当するため計算しない
+    c = b8.shape[0] // 2
+    
+    return np.array([
+        ndvi[c, c],
+        ndwi[c, c],
+        ndbi[c, c],
+        evi[c, c],
+        bsi[c, c],
+        v8[c, c],  # 生値も少し残す
+        v11[c, c]
+    ])
+
+# --- 4. データ抽出 & 学習 ---
+print("2. データ抽出とモデル学習...")
+
+gdf = gpd.read_file(SHP_PATH)
+with rasterio.open(path_b8) as src:
+    if gdf.crs != src.crs: gdf = gdf.to_crs(src.crs)
+
+X_img_raw = []
+X_manual = []
+y_labels = []
+
+# バンドを一括オープン
+with rasterio.open(path_b2) as s2, rasterio.open(path_b3) as s3, \
+     rasterio.open(path_b4) as s4, rasterio.open(path_b8) as s8, \
+     rasterio.open(path_b11) as s11, rasterio.open(path_b12) as s12:
+    
+    print("   -> 教師データ収集中...")
+    for _, row in gdf.iterrows():
+        cid = int(row.get('class-id') or row.get('class_id') or row.get('id'))
+        
+        # 10mバンド基準のWindow
+        py, px = s8.index(row.geometry.x, row.geometry.y)
+        window_10m = Window(px - TILE_SIZE_PX//2, py - TILE_SIZE_PX//2, TILE_SIZE_PX, TILE_SIZE_PX)
+        
+        try:
+            # 10mバンド読み込み
+            d2 = s2.read(1, window=window_10m)
+            d3 = s3.read(1, window=window_10m)
+            d4 = s4.read(1, window=window_10m)
+            d8 = s8.read(1, window=window_10m)
+            
+            # 20mバンド読み込み (10mサイズにリサイズして読み込む)
+            # out_shapeを指定することでrasterioが自動的にリサイズしてくれる
+            d11 = s11.read(1, window=window_10m, out_shape=(TILE_SIZE_PX, TILE_SIZE_PX), resampling=Resampling.bilinear)
+            d12 = s12.read(1, window=window_10m, out_shape=(TILE_SIZE_PX, TILE_SIZE_PX), resampling=Resampling.bilinear)
+            
+            if d8.shape == (TILE_SIZE_PX, TILE_SIZE_PX):
+                # 画像特徴量用 (InceptionはRGB的な情報を好むため B8, B4, B3)
+                img = np.stack([d8, d4, d3], axis=-1).astype(np.float32)
+                
+                # マニュアル特徴量 (SWIR含む全指標)
+                feats = calculate_indices(d2, d3, d4, d8, d11, d12)
+                
+                # Augmentation
+                for k in range(4):
+                    rot_img = np.rot90(img, k)
+                    X_img_raw.append(rot_img)
+                    X_manual.append(feats)
+                    y_labels.append(cid)
+                    
+                    flip_img = np.fliplr(rot_img)
+                    X_img_raw.append(flip_img)
+                    X_manual.append(feats)
+                    y_labels.append(cid)
+        except: pass
+
+X_img_arr = np.array(X_img_raw, dtype=np.float32)
+X_man_arr = np.array(X_manual, dtype=np.float32)
+y = np.array(y_labels)
+
+print(f"   -> データ数: {len(y)}")
+
+# 特徴量抽出 (CNN)
+print("   -> CNN特徴抽出 (GPU)...")
+features_inc_list = []
+for i in range(0, len(X_img_arr), BATCH_SIZE):
+    batch = X_img_arr[i:i+BATCH_SIZE]
+    feats = extract_features_fast(batch)
+    features_inc_list.append(feats.numpy())
+feats_inc = np.concatenate(features_inc_list, axis=0)
+
+# スケーリング
+scaler_man = StandardScaler()
+X_man_scaled = scaler_man.fit_transform(X_man_arr)
+
+# 結合
+X_final = np.hstack([feats_inc, X_man_scaled])
+
+# SVM学習
+print("   -> SVM学習中...")
+X_train, X_test, y_train, y_test = train_test_split(X_final, y, test_size=0.3, random_state=42)
+svm = SVC(kernel='rbf', C=10, gamma='scale')
+svm.fit(X_train, y_train)
+print(f"   -> Test Accuracy: {svm.score(X_test, y_test):.4f}")
+
+# --- 5. 全域マップ作成 ---
+print(f"3. マップ作成中 (Stride={STRIDE}, SWIR自動リサイズ)...")
+
+out_path = os.path.join(OUTPUT_DIR, "MP_MultiIndex_Map.tif")
+
+with rasterio.open(path_b8) as src:
+    H, W = src.height, src.width
+    profile = src.profile
+    profile.update(dtype=rasterio.uint8, count=1, nodata=0)
+
+with rasterio.open(out_path, 'w', **profile) as dst:
+    # 全バンドオープン
+    with rasterio.open(path_b2) as s2, rasterio.open(path_b3) as s3, \
+         rasterio.open(path_b4) as s4, rasterio.open(path_b8) as s8, \
+         rasterio.open(path_b11) as s11, rasterio.open(path_b12) as s12:
+        
+        for r in range(0, H, BLOCK_SIZE):
+            for c in range(0, W, BLOCK_SIZE):
+                gc.collect()
+                
+                # 読み込みウィンドウ設定
+                read_h = min(BLOCK_SIZE + TILE_SIZE_PX, H - r)
+                read_w = min(BLOCK_SIZE + TILE_SIZE_PX, W - c)
+                window = Window(c, r, read_w, read_h)
+                
+                # 10mバンド読み込み
+                d2 = s2.read(1, window=window)
+                d3 = s3.read(1, window=window)
+                d4 = s4.read(1, window=window)
+                d8 = s8.read(1, window=window)
+                
+                # 20mバンド読み込み (10mサイズに合わせてリサイズ読み込み)
+                # out_shapeでd8と同じサイズを指定
+                d11 = s11.read(1, window=window, out_shape=(read_h, read_w), resampling=Resampling.bilinear)
+                d12 = s12.read(1, window=window, out_shape=(read_h, read_w), resampling=Resampling.bilinear)
+                
+                # データ準備
+                act_h = min(BLOCK_SIZE, H - r)
+                act_w = min(BLOCK_SIZE, W - c)
+                limit_h = d8.shape[0] - TILE_SIZE_PX + 1
+                limit_w = d8.shape[1] - TILE_SIZE_PX + 1
+                run_h = min(act_h, limit_h)
+                run_w = min(act_w, limit_w)
+                
+                # インデックス作成
+                i_indices = np.arange(0, run_h, STRIDE)
+                j_indices = np.arange(0, run_w, STRIDE)
+                ii, jj = np.meshgrid(i_indices, j_indices, indexing='ij')
+                flat_i = ii.flatten()
+                flat_j = jj.flatten()
+                
+                num_patches = len(flat_i)
+                block_preds = np.zeros(num_patches, dtype=np.uint8)
+                
+                # バッチ推論
+                for b_start in range(0, num_patches, PREDICT_BATCH_SIZE):
+                    b_end = min(b_start + PREDICT_BATCH_SIZE, num_patches)
+                    b_i = flat_i[b_start:b_end]
+                    b_j = flat_j[b_start:b_end]
+                    
+                    batch_imgs = []
+                    batch_mans = []
+                    
+                    for k in range(len(b_i)):
+                        fi, fj = b_i[k], b_j[k]
+                        
+                        # 画像 (B8, B4, B3)
+                        p_img = np.stack([
+                            d8[fi:fi+TILE_SIZE_PX, fj:fj+TILE_SIZE_PX],
+                            d4[fi:fi+TILE_SIZE_PX, fj:fj+TILE_SIZE_PX],
+                            d3[fi:fi+TILE_SIZE_PX, fj:fj+TILE_SIZE_PX]
+                        ], axis=-1)
+                        
+                        # マニュアル特徴量 (全バンド使用)
+                        p_man = calculate_indices(
+                            d2[fi:fi+TILE_SIZE_PX, fj:fj+TILE_SIZE_PX],
+                            d3[fi:fi+TILE_SIZE_PX, fj:fj+TILE_SIZE_PX],
+                            d4[fi:fi+TILE_SIZE_PX, fj:fj+TILE_SIZE_PX],
+                            d8[fi:fi+TILE_SIZE_PX, fj:fj+TILE_SIZE_PX],
+                            d11[fi:fi+TILE_SIZE_PX, fj:fj+TILE_SIZE_PX],
+                            d12[fi:fi+TILE_SIZE_PX, fj:fj+TILE_SIZE_PX]
+                        )
+                        batch_imgs.append(p_img)
+                        batch_mans.append(p_man)
+                    
+                    # CNN特徴
+                    t_img = tf.convert_to_tensor(np.array(batch_imgs, dtype=np.float32))
+                    f_inc = extract_features_fast(t_img).numpy()
+                    
+                    # マニュアル特徴
+                    f_man = scaler_man.transform(np.array(batch_mans))
+                    
+                    # 結合 & 予測
+                    f_final = np.hstack([f_inc, f_man])
+                    block_preds[b_start:b_end] = svm.predict(f_final)
+                
+                # マップ書き込み処理
+                res_h, res_w = len(i_indices), len(j_indices)
+                mini_map = block_preds.reshape(res_h, res_w)
+                
+                if STRIDE > 1:
+                    full_map = np.repeat(np.repeat(mini_map, STRIDE, axis=0), STRIDE, axis=1)
+                else:
+                    full_map = mini_map
+                
+                final_block = np.zeros((act_h, act_w), dtype=np.uint8)
+                h_cut = min(full_map.shape[0], act_h)
+                w_cut = min(full_map.shape[1], act_w)
+                final_block[:h_cut, :w_cut] = full_map[:h_cut, :w_cut]
+                
+                dst.write(final_block, 1, window=Window(c, r, act_w, act_h))
+                print(f"   -> Block ({r}, {c}) Done")
+
+print("-" * 30)
+print(f"完了: {out_path}")
