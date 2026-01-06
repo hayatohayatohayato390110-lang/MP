@@ -1,0 +1,401 @@
+import os
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+import rasterio
+from rasterio.windows import Window
+from rasterio.warp import transform
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+import glob
+import random
+import time
+import zipfile
+import gc
+from shapely.geometry import Point, box
+import matplotlib.pyplot as plt
+
+# 機械学習
+from sklearn.svm import SVC
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+import tensorflow as tf
+from tensorflow.keras.applications.inception_v3 import InceptionV3, preprocess_input
+
+# =========================================================================
+# 【設定】 最強版 (Ujjain 30km Crop & Full Indices)
+# =========================================================================
+SHP_PATH = r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\multiforestbunnruidata.scpx"
+MAIN_IMAGE_DIR = r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20250202"
+SAFE_DIRS = [
+    r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20241114",
+    r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20241219",
+    r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20250118",
+    r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20250202",
+    r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20250319"
+]
+OUTPUT_DIR = r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2"
+OUTPUT_MAP = os.path.join(OUTPUT_DIR, "Final_Ujjain_30km_Strongest_Map.tif")
+
+# 解析中心座標 (Ujjain, India)
+CENTER_LAT = 23.1765
+CENTER_LON = 75.7885
+RADIUS_KM = 30  # 半径30km
+
+# パラメータ
+PATCH_SIZE = 32
+UPSCALE_SIZE = 128
+POINTS_PER_POLYGON = 50
+GRID_STRIDE = 1   # 全画素解析 (CropするのでこれでOK)
+BLOCK_SIZE = 512  # Crop内なら大きくてもOK
+BATCH_SIZE = 64
+# =========================================================================
+
+def find_band(safe_dir, band):
+    pattern = os.path.join(safe_dir, "**", f"*{band}*.jp2")
+    files = glob.glob(pattern, recursive=True)
+    # TCI/PVIを除外
+    target = [f for f in files if "TCI" not in f and "PVI" not in f and ("_B" in f)]
+    return target[0] if target else None
+
+print("=== 最強版解析開始 (Ujjain 30km圏内限定) ===")
+
+# 1. バンドパス特定 (Blue, SWIRを追加)
+# 必要なバンド: B02(Blue), B03(Green), B04(Red), B08(NIR), B11(SWIR)
+target_bands = ["B02", "B03", "B04", "B08", "B11"]
+
+print("1. 画像パスを特定中...")
+main_paths = {b: find_band(MAIN_IMAGE_DIR, b) for b in target_bands}
+ts_paths = []
+for d in SAFE_DIRS:
+    ts_paths.append({b: find_band(d, b) for b in target_bands})
+
+# 座標系とメタデータ取得
+with rasterio.open(main_paths["B08"]) as src:
+    profile = src.profile.copy()
+    src_transform = src.transform
+    src_crs = src.crs
+    src_height, src_width = src.height, src.width
+
+# --- 2. Ujjain周辺 30km の切り抜き範囲を計算 ---
+print(f"2. 解析エリアを計算中 (中心: {CENTER_LAT}, {CENTER_LON}, 半径: {RADIUS_KM}km)...")
+
+# 緯度経度(WGS84)から画像の座標系(UTM)へ変換
+# 中心点
+xs, ys = transform({'init': 'epsg:4326'}, src_crs, [CENTER_LON], [CENTER_LAT])
+center_x, center_y = xs[0], ys[0]
+
+# 半径30km = 30000m
+radius_m = RADIUS_KM * 1000.0
+min_x, max_x = center_x - radius_m, center_x + radius_m
+min_y, max_y = center_y - radius_m, center_y + radius_m
+
+# ピクセル座標に変換
+row_start, col_start = ~src_transform * (min_x, max_y) # 左上
+row_end, col_end = ~src_transform * (max_x, min_y)     # 右下
+
+# 画像範囲内に収める
+row_start = max(0, int(row_start))
+col_start = max(0, int(col_start))
+row_end = min(src_height, int(row_end))
+col_end = min(src_width, int(col_end))
+
+# 切り抜きウィンドウの作成
+roi_window = Window(col_start, row_start, col_end - col_start, row_end - row_start)
+roi_height = row_end - row_start
+roi_width = col_end - col_start
+
+print(f"   -> 切り抜き範囲: {roi_width}x{roi_height} ピクセル (元の約 {(roi_width*roi_height)/(src_width*src_height)*100:.1f}%)")
+
+# プロファイルの更新 (出力地図用)
+roi_transform = rasterio.windows.transform(roi_window, src_transform)
+profile.update(
+    height=roi_height,
+    width=roi_width,
+    transform=roi_transform,
+    dtype=rasterio.uint8,
+    count=1,
+    nodata=0,
+    compress='lzw'
+)
+
+# --- 指数計算ロジック (関数化) ---
+def calc_indices(b2, b3, b4, b8, b11):
+    # すべて float32 前提
+    # ゼロ除算防止のための微小値
+    eps = 1e-6
+    
+    # 1. NDVI (植生)
+    ndvi = (b8 - b4) / (b8 + b4 + eps)
+    
+    # 2. NDWI (水・水分) Green - NIR
+    ndwi = (b3 - b8) / (b3 + b8 + eps)
+    
+    # 3. NDBI (都市・裸地) SWIR - NIR
+    ndbi = (b11 - b8) / (b11 + b8 + eps)
+    
+    # 4. EVI (拡張植生指数)
+    # EVI = 2.5 * ((NIR - Red) / (NIR + 6*Red - 7.5*Blue + 1))
+    # ※Sentinel-2の値(0-10000)を 0.0-1.0 スケールに合わせる必要がある場合が多いが、
+    # SVMはスケール不変ではないので、StandardScalerにかける前提でそのまま計算しても傾向は出る。
+    # ここでは念のため 10000 で割って反射率スケールに近づけて計算する
+    s = 10000.0
+    evi = 2.5 * ((b8/s - b4/s) / (b8/s + 6*(b4/s) - 7.5*(b2/s) + 1 + eps))
+    
+    # 5. BSI (裸地指数)
+    # ((SWIR + Red) - (NIR + Blue)) / ((SWIR + Red) + (NIR + Blue))
+    bsi = ((b11 + b4) - (b8 + b2)) / ((b11 + b4) + (b8 + b2) + eps)
+    
+    return [ndvi, ndwi, ndbi, evi, bsi]
+
+# --- 3. データ取得関数 ---
+def get_point_data(py, px):
+    # ROI内かどうかのチェックは省略（学習データは全域から取るため）
+    # ただし今回は「Ujjainエリアの地図」を作るので、学習データもエリア内から優先して取ったほうがいいが、
+    # 汎用性を高めるため、教師データは「Shapefileにある全域」から取ります。
+    
+    half = PATCH_SIZE // 2
+    if py < half or py >= src_height-half or px < half or px >= src_width-half: return None
+    try:
+        # A. 画像 (Inception用: RGBの代わりに NIR, Red, Green)
+        window = Window(px - half, py - half, PATCH_SIZE, PATCH_SIZE)
+        with rasterio.open(main_paths["B08"]) as s8, rasterio.open(main_paths["B04"]) as s4, rasterio.open(main_paths["B03"]) as s3:
+            p8 = s8.read(1, window=window).astype('float32')
+            p4 = s4.read(1, window=window).astype('float32')
+            p3 = s3.read(1, window=window).astype('float32')
+        
+        if p8.shape != (PATCH_SIZE, PATCH_SIZE): return None
+        img = np.dstack([p8, p4, p3])
+        denom = np.max(img) - np.min(img)
+        img = (img - np.min(img)) / (denom + 1e-6) * 255.0
+        img_resized = tf.image.resize(img, (UPSCALE_SIZE, UPSCALE_SIZE))
+        input_img = preprocess_input(img_resized)
+
+        # B. 時系列指数 (SVM用)
+        pixel_window = Window(px, py, 1, 1)
+        ts_features = []
+        for paths in ts_paths:
+            if not all(paths.values()): continue
+            # 全バンド読み込み
+            vals = {}
+            for b_name in target_bands:
+                with rasterio.open(paths[b_name]) as src:
+                    vals[b_name] = src.read(1, window=pixel_window)[0, 0].astype('float32')
+            
+            # 指数計算
+            indices = calc_indices(vals["B02"], vals["B03"], vals["B04"], vals["B08"], vals["B11"])
+            
+            # 生データ(NIR) + 指数5種
+            ts_features.append(vals["B08"])
+            ts_features.extend(indices)
+            
+        return input_img, np.array(ts_features)
+    except: return None
+
+# --- 4. Inception-v3 準備 ---
+print("3. AIモデル準備...")
+inception = InceptionV3(weights='imagenet', include_top=False, 
+                        input_shape=(UPSCALE_SIZE, UPSCALE_SIZE, 3), pooling='avg')
+inception.trainable = False
+
+# --- 5. 教師データ収集 ---
+print("4. 教師データを生成中...")
+extract_dir = os.path.dirname(SHP_PATH)
+gpkg_name = "geometry.gpkg"
+gpkg_path = os.path.join(extract_dir, gpkg_name)
+
+try:
+    with zipfile.ZipFile(SHP_PATH, 'r') as z:
+        if gpkg_name in z.namelist(): z.extract(gpkg_name, extract_dir)
+    gdf = gpd.read_file(gpkg_path)
+except: gdf = gpd.read_file(gpkg_path)
+if gdf.crs != src_crs: gdf = gdf.to_crs(src_crs)
+
+target_col = None
+for col in ['class_id', 'macroclass_id', 'C_ID', 'MC_ID']:
+    if col in gdf.columns: target_col = col; break
+if target_col is None: target_col = gdf.columns[0]
+
+X_img_buffer = []
+X_ts_buffer = []
+y_labels = []
+
+print("   サンプリング開始...")
+for idx, row in gdf.iterrows():
+    label = int(row[target_col])
+    geom = row.geometry
+    points = []
+    if geom.geom_type in ['Polygon', 'MultiPolygon']:
+        minx, miny, maxx, maxy = geom.bounds
+        attempts = 0
+        while len(points) < POINTS_PER_POLYGON and attempts < POINTS_PER_POLYGON*5:
+            pnt = Point(random.uniform(minx, maxx), random.uniform(miny, maxy))
+            if geom.contains(pnt): points.append(pnt)
+            attempts += 1
+    else: points.append(geom)
+
+    for p in points:
+        py, px = ~src_transform * (p.x, p.y) # 全体画像上の座標
+        px, py = int(px), int(py)
+        res = get_point_data(py, px)
+        if res is None: continue
+        img, ts = res
+        X_img_buffer.append(img)
+        X_ts_buffer.append(ts)
+        y_labels.append(label)
+    if len(y_labels) % 500 == 0: print(f"   ...{len(y_labels)}点", end="\r")
+
+X_imgs = np.array(X_img_buffer)
+X_ts = np.array(X_ts_buffer)
+y = np.array(y_labels)
+
+# --- 6. SVM学習 ---
+print(f"\n5. SVM学習中 (データ数: {len(y)}, 特徴量次元: 画像2048 + 時系列{X_ts.shape[1]})...")
+X_img_features = inception.predict(X_imgs, batch_size=32, verbose=0)
+X_combined = np.concatenate([X_img_features, X_ts], axis=1)
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X_combined)
+
+le = LabelEncoder()
+y_encoded = le.fit_transform(y)
+X_train, X_test, y_train, y_test = train_test_split(X_scaled, y_encoded, test_size=0.2, random_state=42)
+
+svm = SVC(kernel='rbf', C=1.0, probability=False, random_state=42)
+svm.fit(X_train, y_train)
+print(f"   Train Acc: {svm.score(X_train, y_train)*100:.2f}%, Test Acc: {svm.score(X_test, y_test)*100:.2f}%")
+
+# --- 7. マップ作成 (Ujjain Cropエリアのみ) ---
+print("\n6. マップ作成 (Ujjain 30km圏内)...")
+final_map = np.zeros((roi_height, roi_width), dtype=np.uint8)
+half = PATCH_SIZE // 2
+
+# ファイルオープン (全体)
+srcs = {} # ネストした辞書で管理
+for t_idx, paths in enumerate([main_paths] + ts_paths): # mainもtsも含める
+    # keyは 'main' または index
+    key = 'main' if t_idx == 0 else t_idx - 1 
+    if key != 'main' and not all(paths.values()): continue
+    
+    srcs[key] = {}
+    for b_name in target_bands:
+        srcs[key][b_name] = rasterio.open(paths[b_name])
+
+start_time = time.time()
+
+try:
+    # ROI内をブロック処理 (全体座標ではなく、ROI相対座標でループ)
+    for r_blk in range(0, roi_height, BLOCK_SIZE):
+        for c_blk in range(0, roi_width, BLOCK_SIZE):
+            
+            # ROI内でのブロック範囲
+            r_end_blk = min(roi_height, r_blk + BLOCK_SIZE)
+            c_end_blk = min(roi_width, c_blk + BLOCK_SIZE)
+            
+            # 元画像(全体)上の読み込み位置 (ROIオフセット + ブロック位置)
+            # 余白(Padding)を含めて読む
+            abs_r_start = row_start + r_blk - half
+            abs_c_start = col_start + c_blk - half
+            abs_h = (r_end_blk - r_blk) + 2*half
+            abs_w = (c_end_blk - c_blk) + 2*half
+            
+            read_win = Window(abs_c_start, abs_r_start, abs_w, abs_h)
+            
+            # データロード
+            try:
+                # 全データ保持用
+                loaded_data = {} # {key: {band: array}}
+                
+                # ループで全時期・全バンド読み込み
+                for key, band_srcs in srcs.items():
+                    loaded_data[key] = {}
+                    for b_name, src in band_srcs.items():
+                        # float32で読み込み
+                        loaded_data[key][b_name] = src.read(1, window=read_win).astype('float32')
+            except Exception: continue
+
+            # メモリ内スキャン
+            batch_imgs = []
+            batch_ts = []
+            coords = []
+            
+            valid_h = r_end_blk - r_blk
+            valid_w = c_end_blk - c_blk
+            
+            for br in range(0, valid_h, GRID_STRIDE):
+                for bc in range(0, valid_w, GRID_STRIDE):
+                    # ローカル配列内のインデックス (余白 half を考慮)
+                    lr = br + half
+                    lc = bc + half
+                    
+                    # 画像作成 (Main: B08, B04, B03)
+                    p8 = loaded_data['main']['B08'][lr-half:lr+half, lc-half:lc+half]
+                    if p8.shape != (PATCH_SIZE, PATCH_SIZE): continue
+                    p4 = loaded_data['main']['B04'][lr-half:lr+half, lc-half:lc+half]
+                    p3 = loaded_data['main']['B03'][lr-half:lr+half, lc-half:lc+half]
+                    
+                    img = np.dstack([p8, p4, p3])
+                    denom = np.max(img) - np.min(img)
+                    img = (img - np.min(img)) / (denom + 1e-6) * 255.0
+                    
+                    # 時系列特徴量作成
+                    ts_vec = []
+                    for i in range(len(ts_paths)):
+                        if i not in loaded_data: continue
+                        d = loaded_data[i]
+                        # その画素のバンド値
+                        v2, v3, v4, v8, v11 = d['B02'][lr,lc], d['B03'][lr,lc], d['B04'][lr,lc], d['B08'][lr,lc], d['B11'][lr,lc]
+                        
+                        indices = calc_indices(v2, v3, v4, v8, v11)
+                        ts_vec.append(v8)
+                        ts_vec.extend(indices)
+                        
+                    batch_imgs.append(img)
+                    batch_ts.append(np.array(ts_vec))
+                    coords.append((br, bc))
+                    
+                    # バッチ推論
+                    if len(batch_imgs) >= BATCH_SIZE:
+                        imgs_tensor = tf.image.resize(np.array(batch_imgs), (UPSCALE_SIZE, UPSCALE_SIZE))
+                        imgs_pre = preprocess_input(imgs_tensor)
+                        feats_img = inception.predict(imgs_pre, verbose=0)
+                        
+                        feats_comb = np.concatenate([feats_img, np.array(batch_ts)], axis=1)
+                        feats_scaled = scaler.transform(feats_comb)
+                        preds = svm.predict(feats_scaled)
+                        
+                        for k, (l_br, l_bc) in enumerate(coords):
+                            final_map[r_blk + l_br : r_blk + l_br + GRID_STRIDE, 
+                                      c_blk + l_bc : c_blk + l_bc + GRID_STRIDE] = preds[k]
+                        
+                        batch_imgs, batch_ts, coords = [], [], []
+
+            # 端数処理
+            if len(batch_imgs) > 0:
+                imgs_tensor = tf.image.resize(np.array(batch_imgs), (UPSCALE_SIZE, UPSCALE_SIZE))
+                imgs_pre = preprocess_input(imgs_tensor)
+                feats_img = inception.predict(imgs_pre, verbose=0)
+                feats_comb = np.concatenate([feats_img, np.array(batch_ts)], axis=1)
+                feats_scaled = scaler.transform(feats_comb)
+                preds = svm.predict(feats_scaled)
+                
+                for k, (l_br, l_bc) in enumerate(coords):
+                    final_map[r_blk + l_br : r_blk + l_br + GRID_STRIDE, 
+                              c_blk + l_bc : c_blk + l_bc + GRID_STRIDE] = preds[k]
+
+            elapsed = time.time() - start_time
+            if (r_blk + c_blk) % (BLOCK_SIZE * 2) == 0:
+                print(f"   Block {r_blk},{c_blk} 完了 (経過: {elapsed/60:.1f}分)...", end="\r")
+            
+            del loaded_data
+            gc.collect()
+
+finally:
+    for group in srcs.values():
+        for s in group.values(): s.close()
+
+print("\nファイル保存中...")
+with rasterio.open(OUTPUT_MAP, 'w', **profile) as dst:
+    dst.write(final_map, 1)
+
+print(f"=== 最強版解析完了: {OUTPUT_MAP} ===")
