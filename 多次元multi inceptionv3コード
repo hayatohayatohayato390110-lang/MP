@@ -24,7 +24,7 @@ import tensorflow as tf
 from tensorflow.keras.applications.inception_v3 import InceptionV3, preprocess_input
 
 # =========================================================================
-# 【設定】 真・最強版 (Ujjain 30km, Full Bands including B12)
+# 【設定】 最終版 (Auto-Center from Teacher Data)
 # =========================================================================
 SHP_PATH = r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\multiforestbunnruidata.scpx"
 MAIN_IMAGE_DIR = r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20250202"
@@ -36,11 +36,9 @@ SAFE_DIRS = [
     r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20250319"
 ]
 OUTPUT_DIR = r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2"
-OUTPUT_MAP = os.path.join(OUTPUT_DIR, "Final_Ujjain_30km_Ultra_Map.tif")
+OUTPUT_MAP = os.path.join(OUTPUT_DIR, "Final_Correct_Location_Map.tif")
 
-# 解析中心座標 (Ujjain)
-CENTER_LAT = 23.1765
-CENTER_LON = 75.7885
+# 解析半径 (教師データの中心から)
 RADIUS_KM = 30 
 
 # パラメータ
@@ -58,56 +56,66 @@ def find_band(safe_dir, band):
     target = [f for f in files if "TCI" not in f and "PVI" not in f and ("_B" in f)]
     return target[0] if target else None
 
-print("=== 真・最強版解析開始 (B12追加 & 解像度自動補正) ===")
+print("=== 最終版解析開始 (位置自動補正 & B12完全対応) ===")
 
-# 1. バンドパス特定 (B12を追加)
-# 10mバンド: B02, B03, B04, B08
-# 20mバンド: B11, B12
+# 1. バンドパス特定
 target_bands = ["B02", "B03", "B04", "B08", "B11", "B12"]
-
 print("1. 画像パスを特定中...")
 main_paths = {b: find_band(MAIN_IMAGE_DIR, b) for b in target_bands}
 ts_paths = []
 for d in SAFE_DIRS:
     found = {b: find_band(d, b) for b in target_bands}
-    if all(found.values()):
-        ts_paths.append(found)
-    else:
-        print(f"   [Skip] フォルダ {os.path.basename(d)} は一部バンドが不足しています。")
+    if all(found.values()): ts_paths.append(found)
 
 if not all(main_paths.values()):
-    raise FileNotFoundError("メイン画像の必須バンド(B02-B12)が見つかりません。")
+    raise FileNotFoundError("必須バンドが見つかりません。")
 
-# 座標系基準 (B08: 10m)
+# 画像情報の取得 (B08基準)
 with rasterio.open(main_paths["B08"]) as src:
     profile = src.profile.copy()
     src_transform = src.transform
     src_crs = src.crs
     src_height, src_width = src.height, src.width
-    src_bounds = src.bounds # (left, bottom, right, top)
+    src_bounds = src.bounds
 
-# --- 2. 解析エリア (Ujjain 30km) 計算 ---
-print(f"2. 解析エリア計算 (中心: {CENTER_LAT}, {CENTER_LON})...")
-xs, ys = transform({'init': 'epsg:4326'}, src_crs, [CENTER_LON], [CENTER_LAT])
-center_x, center_y = xs[0], ys[0]
+# --- 2. 教師データの読み込み & 中心位置の特定 ---
+print("2. 教師データから解析エリアを自動計算中...")
+extract_dir = os.path.dirname(SHP_PATH)
+gpkg_name = "geometry.gpkg"
+gpkg_path = os.path.join(extract_dir, gpkg_name)
+
+try:
+    with zipfile.ZipFile(SHP_PATH, 'r') as z:
+        if gpkg_name in z.namelist(): z.extract(gpkg_name, extract_dir)
+    gdf = gpd.read_file(gpkg_path)
+except: gdf = gpd.read_file(gpkg_path)
+
+# 教師データを画像と同じ座標系に変換
+if gdf.crs != src_crs:
+    gdf = gdf.to_crs(src_crs)
+
+# ★ここが修正ポイント：教師データの「重心」を計算
+total_bounds = gdf.total_bounds # (minx, miny, maxx, maxy)
+center_x = (total_bounds[0] + total_bounds[2]) / 2
+center_y = (total_bounds[1] + total_bounds[3]) / 2
+print(f"   -> 教師データの中心: {center_x:.1f}, {center_y:.1f} (UTM座標)")
+
+# 中心から半径30kmの範囲を計算
 radius_m = RADIUS_KM * 1000.0
-
-# マップ座標系での切り抜き範囲
 roi_min_x = max(src_bounds.left, center_x - radius_m)
 roi_max_x = min(src_bounds.right, center_x + radius_m)
 roi_min_y = max(src_bounds.bottom, center_y - radius_m)
 roi_max_y = min(src_bounds.top, center_y + radius_m)
 
-# ピクセル座標に変換 (B08基準)
+# ピクセル座標に変換
 window_full = rasterio.windows.from_bounds(roi_min_x, roi_min_y, roi_max_x, roi_max_y, transform=src_transform)
-roi_window = window_full.round_offsets().round_shape() # 整数に丸める
+roi_window = window_full.round_offsets().round_shape()
 
 roi_height = int(roi_window.height)
 roi_width = int(roi_window.width)
 roi_transform = rasterio.windows.transform(roi_window, src_transform)
 
-print(f"   -> 切り抜きサイズ: {roi_width}x{roi_height} (約 {roi_width*10//1000}x{roi_height*10//1000} km)")
-
+print(f"   -> 確定した切り抜きサイズ: {roi_width}x{roi_height} ピクセル")
 profile.update(height=roi_height, width=roi_width, transform=roi_transform, count=1, dtype=rasterio.uint8)
 
 # --- 指数計算 (B12対応) ---
@@ -122,21 +130,19 @@ def calc_indices(b2, b3, b4, b8, b11, b12):
     # EVI (拡張植生)
     s = 10000.0
     evi = 2.5 * ((b8/s - b4/s) / (b8/s + 6*(b4/s) - 7.5*(b2/s) + 1 + eps))
-    # BSI (裸地) - 通常 (SWIR1 + Red) - (NIR + Blue) ...
-    # ここでは B11(SWIR1) をメインに使いますが、B12も特徴量としてそのまま使います
+    # BSI (裸地)
     bsi = ((b11 + b4) - (b8 + b2)) / ((b11 + b4) + (b8 + b2) + eps)
-    
     return [ndvi, ndwi, ndbi, evi, bsi]
 
-# --- 3. データ取得関数 (地理座標ベースでズレなし) ---
+# --- 3. データ取得関数 (地理座標対応) ---
 def get_point_data(p_geom):
     try:
-        # A. 画像 (Inception用) - 10m基準
-        # マップ座標(x,y)からピクセル位置(row,col)を計算
+        # A. 画像 (Inception用)
         py, px = ~src_transform * (p_geom.x, p_geom.y)
         px, py = int(px), int(py)
         
         half = PATCH_SIZE // 2
+        # 画像範囲外チェック
         if py < half or py >= src_height-half or px < half or px >= src_width-half: return None
         
         window = Window(px - half, py - half, PATCH_SIZE, PATCH_SIZE)
@@ -154,34 +160,28 @@ def get_point_data(p_geom):
         img_resized = tf.image.resize(img, (UPSCALE_SIZE, UPSCALE_SIZE))
         input_img = preprocess_input(img_resized)
 
-        # B. 時系列指数 (地理座標を使って各ファイルから正確に取得)
+        # B. 時系列指数
         ts_features = []
         for paths in ts_paths:
             vals = {}
             for b_name in target_bands:
                 with rasterio.open(paths[b_name]) as src:
-                    # 地理座標 (p_geom.x, p_geom.y) を使って、そのファイルの正しいindexを取得
-                    # これにより 10m/20m の違いを吸収
+                    # 地理座標から取得 (解像度ズレ吸収)
                     r, c = src.index(p_geom.x, p_geom.y)
-                    # 範囲外チェック
                     if 0 <= r < src.height and 0 <= c < src.width:
                          vals[b_name] = src.read(1, window=Window(c, r, 1, 1))[0, 0].astype('float32')
-                    else:
-                        vals[b_name] = 0.0 # 範囲外
+                    else: vals[b_name] = 0.0
             
-            # 必要なバンドが取れていれば計算
-            if all(v > 0 for v in vals.values()): # 簡易チェック
+            if all(v > 0 for v in vals.values()):
                 indices = calc_indices(vals["B02"], vals["B03"], vals["B04"], vals["B08"], vals["B11"], vals["B12"])
-                ts_features.append(vals["B08"]) # Raw NIR
-                ts_features.append(vals["B12"]) # Raw SWIR2 (追加！)
+                ts_features.append(vals["B08"])
+                ts_features.append(vals["B12"])
                 ts_features.extend(indices)
             else:
-                # 欠損時は0埋め (エラー回避)
-                ts_features.extend([0.0] * 7) # B08, B12, +5 indices
+                ts_features.extend([0.0] * 7)
 
         return input_img, np.array(ts_features)
-    except Exception: 
-        return None
+    except: return None
 
 # --- 4. Inception準備 ---
 print("3. AIモデル準備...")
@@ -189,19 +189,9 @@ inception = InceptionV3(weights='imagenet', include_top=False,
                         input_shape=(UPSCALE_SIZE, UPSCALE_SIZE, 3), pooling='avg')
 inception.trainable = False
 
-# --- 5. 教師データ収集 ---
+# --- 5. 教師データ収集 (再) ---
 print("4. 教師データを生成中...")
-extract_dir = os.path.dirname(SHP_PATH)
-gpkg_name = "geometry.gpkg"
-gpkg_path = os.path.join(extract_dir, gpkg_name)
-
-try:
-    with zipfile.ZipFile(SHP_PATH, 'r') as z:
-        if gpkg_name in z.namelist(): z.extract(gpkg_name, extract_dir)
-    gdf = gpd.read_file(gpkg_path)
-except: gdf = gpd.read_file(gpkg_path)
-if gdf.crs != src_crs: gdf = gdf.to_crs(src_crs)
-
+# クラス列特定
 target_col = None
 for col in ['class_id', 'macroclass_id', 'C_ID', 'MC_ID']:
     if col in gdf.columns: target_col = col; break
@@ -211,7 +201,7 @@ X_img_buffer = []
 X_ts_buffer = []
 y_labels = []
 
-print("   サンプリング開始 (バンド解像度自動補正付き)...")
+print("   サンプリング開始...")
 for idx, row in gdf.iterrows():
     label = int(row[target_col])
     geom = row.geometry
@@ -236,16 +226,12 @@ for idx, row in gdf.iterrows():
     if len(y_labels) > 0 and len(y_labels) % 500 == 0: 
         print(f"   ...{len(y_labels)}点", end="\r")
 
-if len(y_labels) == 0:
-    raise ValueError("学習データが作成できませんでした。")
-
 X_imgs = np.array(X_img_buffer)
 X_ts = np.array(X_ts_buffer)
 y = np.array(y_labels)
 
 # --- 6. SVM学習 ---
 print(f"\n5. SVM学習中 (データ数: {len(y)})...")
-# 特徴抽出
 X_img_features = inception.predict(X_imgs, batch_size=32, verbose=0)
 X_combined = np.concatenate([X_img_features, X_ts], axis=1)
 scaler = StandardScaler()
@@ -259,12 +245,12 @@ svm = SVC(kernel='rbf', C=1.0, probability=False, random_state=42)
 svm.fit(X_train, y_train)
 print(f"   Train Acc: {svm.score(X_train, y_train)*100:.2f}%, Test Acc: {svm.score(X_test, y_test)*100:.2f}%")
 
-# --- 7. マップ作成 (Ujjain Crop & 地理座標ベース読み込み) ---
-print("\n6. マップ作成 (Ujjain 30km圏内)...")
+# --- 7. マップ作成 (自動補正エリア) ---
+print("\n6. マップ作成 (教師データ周辺エリア)...")
 final_map = np.zeros((roi_height, roi_width), dtype=np.uint8)
 half = PATCH_SIZE // 2
 
-# ファイルオープン (全体)
+# ファイルオープン
 srcs = {} 
 for t_idx, paths in enumerate([main_paths] + ts_paths): 
     key = 'main' if t_idx == 0 else t_idx - 1 
@@ -278,24 +264,22 @@ try:
     for r_blk in range(0, roi_height, BLOCK_SIZE):
         for c_blk in range(0, roi_width, BLOCK_SIZE):
             
-            # ブロックの地理座標範囲 (bounds) を計算
-            # 1. ブロックのピクセル範囲 (ROI基準)
+            # ROIウィンドウ上のブロック範囲
+            abs_r_start = roi_window.row_off + r_blk - half
+            abs_c_start = roi_window.col_off + c_blk - half
+            
+            # ブロックサイズ (ROI境界考慮)
             r_end_blk = min(roi_height, r_blk + BLOCK_SIZE)
             c_end_blk = min(roi_width, c_blk + BLOCK_SIZE)
             
-            # 2. ブロックのピクセル範囲 (全体画像基準、余白込み)
-            abs_r_start = roi_window.row_off + r_blk - half
-            abs_c_start = roi_window.col_off + c_blk - half
             abs_h = (r_end_blk - r_blk) + 2*half
             abs_w = (c_end_blk - c_blk) + 2*half
             
-            # 3. このブロックの地理的範囲 (Left, Bottom, Right, Top) を計算
-            # rasterio.windows.bounds は (col, row, w, h) -> (left, bottom, right, top)
+            # 地理座標バウンディングボックスを取得
             blk_win = Window(abs_c_start, abs_r_start, abs_w, abs_h)
             blk_bounds = rasterio.windows.bounds(blk_win, src_transform)
             
-            # --- データロード (地理座標バウンディングボックスを使って読み込む) ---
-            # これで 10m画像も 20m画像も、同じ「地理的範囲」を切り出せる
+            # --- データロード (Boundsベース) ---
             loaded_data = {} 
             skip_block = False
             
@@ -303,23 +287,16 @@ try:
                 for key, band_srcs in srcs.items():
                     loaded_data[key] = {}
                     for b_name, src in band_srcs.items():
-                        # 地理的範囲から、そのファイル固有のWindowを計算
-                        # (これで20mバンドも正しいピクセル範囲が取れる)
+                        # 地理的範囲からWindowを逆算 (これで解像度ズレ解消)
                         src_win = src.window(*blk_bounds)
-                        
-                        # 読み込み & 10mサイズ(abs_h, abs_w)に強制リサイズ
-                        # resampling=1 (Nearest) or 5 (Bilinear)
-                        # ここでは Bilinear (Averageっぽい挙動) で滑らかに拡大
-                        data = src.read(1, window=src_win, out_shape=(abs_h, abs_w), resampling=5)
+                        # 強制リサイズ読み込み
+                        data = src.read(1, window=src_win, out_shape=(int(abs_h), int(abs_w)), resampling=5)
                         loaded_data[key][b_name] = data.astype('float32')
-
-            except Exception as e:
-                # print(f"Block Error: {e}")
-                skip_block = True
+            except Exception: skip_block = True
             
             if skip_block: continue
 
-            # メモリ内スキャン
+            # 推論ループ
             batch_imgs = []
             batch_ts = []
             coords = []
@@ -331,8 +308,6 @@ try:
                 for bc in range(0, valid_w, GRID_STRIDE):
                     lr = br + half
                     lc = bc + half
-                    
-                    # 範囲外ガード
                     if lr >= abs_h or lc >= abs_w: continue
 
                     p8 = loaded_data['main']['B08'][lr-half:lr+half, lc-half:lc+half]
@@ -350,7 +325,7 @@ try:
                         v2, v3, v4, v8, v11, v12 = d['B02'][lr,lc], d['B03'][lr,lc], d['B04'][lr,lc], d['B08'][lr,lc], d['B11'][lr,lc], d['B12'][lr,lc]
                         indices = calc_indices(v2, v3, v4, v8, v11, v12)
                         ts_vec.append(v8)
-                        ts_vec.append(v12) # B12も特徴量に追加
+                        ts_vec.append(v12)
                         ts_vec.extend(indices)
                         
                     batch_imgs.append(img)
