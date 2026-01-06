@@ -1,0 +1,305 @@
+import os
+import glob
+import zipfile
+import tempfile
+import numpy as np
+import rasterio
+from rasterio.windows import Window
+from rasterio.vrt import WarpedVRT
+from rasterio.enums import Resampling
+from rasterio import features as rast_features
+import geopandas as gpd
+from sklearn.ensemble import RandomForestClassifier
+from scipy.ndimage import generic_filter
+from contextlib import ExitStack
+import gc
+
+# ==================== 設定エリア ====================
+
+# 1. 衛星画像があるフォルダのリスト (時系列順: 10月～1月)
+base_dirs = [
+    r"G:\SATELITEIMAGE\RABI\Mahashutra\20251013", # Index 0
+    r"G:\SATELITEIMAGE\RABI\Mahashutra\20251020", # Index 1
+    r"G:\SATELITEIMAGE\RABI\Mahashutra\20251109", # Index 2: 11月上旬
+    r"G:\SATELITEIMAGE\RABI\Mahashutra\20251127", # Index 3
+    r"G:\SATELITEIMAGE\RABI\Mahashutra\20251212", # Index 4: 12月中旬
+    r"G:\SATELITEIMAGE\RABI\Mahashutra\20260101"  # Index 5: 1月上旬 (最新)
+]
+
+# 2. 教師データ (.scpx) のパス
+scpx_path = r"G:\SATELITEIMAGE\RABI\Mahashutra\Kharbao.scpx"
+
+# 3. 結果を保存するファイル名 (All Indices版)
+output_tif = r"G:\SATELITEIMAGE\RABI\Mahashutra\classification_result_Kharbao_RF_AllIndices.tif"
+
+# ====================================================
+
+def get_band_path(directory, band_name):
+    """指定されたフォルダから特定のバンドファイルを検索する"""
+    search_patterns = [
+        os.path.join(directory, "**", f"*{band_name}*.jp2"),
+        os.path.join(directory, "**", f"*{band_name}*.tif"),
+        os.path.join(directory, "**", f"*{band_name}*.TIF")
+    ]
+    for pattern in search_patterns:
+        files = glob.glob(pattern, recursive=True)
+        valid_files = [f for f in files if "TCI" not in f and "PVI" not in f]
+        if valid_files:
+            return valid_files[0]
+    return None
+
+def calculate_indices(b2, b3, b4, b8, b11, b12):
+    """
+    全要素（Reflectance, NDVI, NDWI, Texture, NDBI, EVI, BSI）を計算してスタックする
+    """
+    epsilon = 1e-6
+    
+    # 1. NDVI (正規化植生指数)
+    ndvi = (b8 - b4) / (b8 + b4 + epsilon)
+    
+    # 2. NDWI (正規化水指数)
+    ndwi = (b3 - b8) / (b3 + b8 + epsilon)
+    
+    # 3. Texture (近赤外B8の表面粗さ)
+    texture = generic_filter(b8, np.std, size=3)
+
+    # 4. NDBI (正規化都市指数)
+    # (SWIR1 - NIR) / (SWIR1 + NIR)
+    ndbi = (b11 - b8) / (b11 + b8 + epsilon)
+
+    # 5. 【追加】EVI (Enhanced Vegetation Index)
+    # 大気補正を含んだ植生指数: 2.5 * (NIR - Red) / (NIR + 6*Red - 7.5*Blue + 1)
+    evi = 2.5 * (b8 - b4) / (b8 + 6.0 * b4 - 7.5 * b2 + 1.0 + epsilon)
+
+    # 6. 【追加】BSI (Bare Soil Index / 裸地指数)
+    # ((SWIR1 + Red) - (NIR + Blue)) / ((SWIR1 + Red) + (NIR + Blue))
+    # 黒い土や乾燥地を強調し、水と区別するのに役立つ
+    bsi = ((b11 + b4) - (b8 + b2)) / ((b11 + b4) + (b8 + b2) + epsilon)
+    
+    # スタック順序: 合計12バンド
+    # [0:Blue, 1:Green, 2:Red, 3:NIR, 4:SWIR1, 5:SWIR2, 
+    #  6:NDVI, 7:NDWI, 8:Texture, 9:NDBI, 10:EVI, 11:BSI]
+    return np.stack([b2, b3, b4, b8, b11, b12, ndvi, ndwi, texture, ndbi, evi, bsi])
+
+def add_temporal_differences(X_stack):
+    """
+    時系列の特徴変化を計算する。
+    """
+    # Kharbao用の時期インデックス
+    idx_early = 2  # 11月上旬
+    idx_mid   = 4  # 12月中旬
+    idx_late  = 5  # 1月上旬
+    
+    # 【変更点】EVI, BSIが増えたので 12 に設定
+    bands_per_date = 12
+    
+    # NIR(B8)の位置 (index 3)
+    offset_nir = 3
+    nir_early = X_stack[:, idx_early * bands_per_date + offset_nir]
+    nir_mid   = X_stack[:, idx_mid * bands_per_date + offset_nir]
+    nir_late  = X_stack[:, idx_late * bands_per_date + offset_nir]
+
+    # --- 差分特徴量の計算 ---
+    diff_nir_late_early = nir_late - nir_early
+    diff_nir_late_mid = nir_late - nir_mid
+    
+    # NDVIの位置 (index 6)
+    offset_ndvi = 6
+    ndvi_early = X_stack[:, idx_early * bands_per_date + offset_ndvi]
+    ndvi_late  = X_stack[:, idx_late * bands_per_date + offset_ndvi]
+    diff_ndvi_late_early = ndvi_late - ndvi_early
+
+    # 結合
+    return np.column_stack([X_stack, diff_nir_late_early, diff_nir_late_mid, diff_ndvi_late_early])
+
+
+# --- メイン処理 ---
+
+print("処理を開始します（Full Indices Analysis）...")
+
+# 0. 基準プロファイル
+ref_path = get_band_path(base_dirs[0], "B02")
+if not ref_path: raise ValueError(f"基準画像(B02)が見つかりません: {base_dirs[0]}")
+
+with rasterio.open(ref_path) as src0:
+    profile = src0.profile
+    h, w = src0.height, src0.width
+    crs = src0.crs
+    transform = src0.transform
+
+# 1. 教師データ読み込み
+print(f"教師データを読み込んでいます: {scpx_path}")
+gdf = None
+with tempfile.TemporaryDirectory() as temp_dir:
+    with zipfile.ZipFile(scpx_path, 'r') as zip_ref:
+        gpkg_name = next((f for f in zip_ref.namelist() if f.endswith('.gpkg')), None)
+        if gpkg_name:
+            zip_ref.extract(gpkg_name, temp_dir)
+            gdf = gpd.read_file(os.path.join(temp_dir, gpkg_name))
+            if gdf.crs != crs: gdf = gdf.to_crs(crs)
+
+if gdf is None: raise ValueError("教師データ読み込み失敗")
+target_col = next((c for c in ['class_id', 'C_ID', 'id', 'Class_ID', 'MC_ID'] if c in gdf.columns), None)
+
+# 2. 学習データ抽出
+print("学習データを抽出中...")
+
+shapes = ((geom, value) for geom, value in zip(gdf.geometry, gdf[target_col]))
+roi_mask_full = rast_features.rasterize(shapes=shapes, out_shape=(h, w), transform=transform, dtype=np.uint8)
+
+X_train_list = []
+y_train_list = []
+
+# ★フルパワー設定: 1024
+extract_block_size = 1024 
+
+for date_idx, directory in enumerate(base_dirs):
+    print(f"  - 時期 {date_idx+1}/{len(base_dirs)}: {os.path.basename(directory)}")
+    
+    p_b2 = get_band_path(directory, "B02") or get_band_path(directory, "B2")
+    p_b3 = get_band_path(directory, "B03") or get_band_path(directory, "B3")
+    p_b4 = get_band_path(directory, "B04") or get_band_path(directory, "B4")
+    p_b8 = get_band_path(directory, "B08") or get_band_path(directory, "B8")
+    p_b11 = get_band_path(directory, "B11")
+    p_b12 = get_band_path(directory, "B12")
+    
+    if not all([p_b2, p_b3, p_b4, p_b8, p_b11, p_b12]): 
+        print(f"    警告: バンド不足 {os.path.basename(directory)}")
+        continue
+
+    date_features_list = []
+    
+    def open_vrt(path):
+        src = rasterio.open(path)
+        return WarpedVRT(src, crs=crs, transform=transform, width=w, height=h, resampling=Resampling.bilinear)
+
+    with ExitStack() as stack:
+        vrt_b2 = stack.enter_context(open_vrt(p_b2))
+        vrt_b3 = stack.enter_context(open_vrt(p_b3))
+        vrt_b4 = stack.enter_context(open_vrt(p_b4))
+        vrt_b8 = stack.enter_context(open_vrt(p_b8))
+        vrt_b11 = stack.enter_context(open_vrt(p_b11))
+        vrt_b12 = stack.enter_context(open_vrt(p_b12))
+
+        for i in range(0, h, extract_block_size):
+            for j in range(0, w, extract_block_size):
+                window = Window(j, i, min(extract_block_size, w - j), min(extract_block_size, h - i))
+                mask_block = roi_mask_full[window.row_off:window.row_off+window.height, 
+                                           window.col_off:window.col_off+window.width]
+                
+                if not np.any(mask_block > 0): continue 
+                
+                b2 = vrt_b2.read(1, window=window).astype(np.float32)
+                b3 = vrt_b3.read(1, window=window).astype(np.float32)
+                b4 = vrt_b4.read(1, window=window).astype(np.float32)
+                b8 = vrt_b8.read(1, window=window).astype(np.float32)
+                b11 = vrt_b11.read(1, window=window).astype(np.float32)
+                b12 = vrt_b12.read(1, window=window).astype(np.float32)
+                
+                # 計算 (NDBI, EVI, BSI含む)
+                feats = calculate_indices(b2, b3, b4, b8, b11, b12)
+                
+                valid_pixels = (mask_block > 0)
+                extracted = feats[:, valid_pixels].T
+                date_features_list.append(extracted)
+                
+                if date_idx == 0:
+                    y_train_list.append(mask_block[valid_pixels])
+
+    if date_features_list:
+        X_train_list.append(np.vstack(date_features_list))
+    
+    gc.collect()
+
+# データの結合
+print("全データを結合中...")
+if not X_train_list: raise ValueError("学習データなし")
+
+min_len = min([len(x) for x in X_train_list] + [len(np.hstack(y_train_list))])
+X_train = np.hstack([x[:min_len] for x in X_train_list])
+y_train = np.hstack(y_train_list)[:min_len]
+X_train = np.nan_to_num(X_train)
+
+# 【差分特徴量の追加】 (全12バンド対応済み)
+X_train = add_temporal_differences(X_train)
+
+print(f"学習データ準備完了: {X_train.shape[0]} 点, 次元数: {X_train.shape[1]}")
+
+# 3. AI学習
+print("AIモデルを学習中 (Full Power: n_jobs=-1)...")
+
+# ★フルパワー設定: class_weight='balanced'
+rf = RandomForestClassifier(n_estimators=200, n_jobs=-1, random_state=42, class_weight='balanced')
+rf.fit(X_train, y_train)
+print("学習完了！")
+
+# 4. 全画面分類
+print(f"全画像の分類を開始します... 出力先: {output_tif}")
+
+profile.update(driver='GTiff', count=1, dtype=rasterio.uint8, nodata=0, compress='lzw', tiled=True, blockxsize=256, blockysize=256)
+rf.n_jobs = 1 
+
+# ★フルパワー設定: 512
+process_block_size = 512
+
+with rasterio.open(output_tif, 'w', **profile) as dst:
+    total_rows = (h // process_block_size) + 1
+    row_count = 0
+    
+    for i in range(0, h, process_block_size):
+        row_count += 1
+        print(f"    - 分類進捗: {row_count}/{total_rows} 行目...", end="\r")
+        
+        for j in range(0, w, process_block_size):
+            window = Window(j, i, min(process_block_size, w - j), min(process_block_size, h - i))
+            win_h, win_w = window.height, window.width
+            
+            block_features_list = []
+            
+            # 各時期の画像読み込み
+            for directory in base_dirs:
+                p_b2 = get_band_path(directory, "B02") or get_band_path(directory, "B2")
+                p_b3 = get_band_path(directory, "B03") or get_band_path(directory, "B3")
+                p_b4 = get_band_path(directory, "B04") or get_band_path(directory, "B4")
+                p_b8 = get_band_path(directory, "B08") or get_band_path(directory, "B8")
+                p_b11 = get_band_path(directory, "B11")
+                p_b12 = get_band_path(directory, "B12")
+                
+                if not all([p_b2, p_b3, p_b4, p_b8, p_b11, p_b12]): continue
+
+                def read_win(p):
+                    with rasterio.open(p) as src:
+                        with WarpedVRT(src, crs=crs, transform=transform, width=w, height=h, resampling=Resampling.bilinear) as vrt:
+                            return vrt.read(1, window=window).astype(np.float32)
+
+                wb2 = read_win(p_b2)
+                wb3 = read_win(p_b3)
+                wb4 = read_win(p_b4)
+                wb8 = read_win(p_b8)
+                wb11 = read_win(p_b11)
+                wb12 = read_win(p_b12)
+                
+                # 計算 (NDBI, EVI, BSI含む)
+                w_feats = calculate_indices(wb2, wb3, wb4, wb8, wb11, wb12)
+                
+                # 【重要】12バンドにリシェイプ (要素が増えたため)
+                w_feats_flat = w_feats.reshape(12, -1).T 
+                block_features_list.append(w_feats_flat)
+            
+            if len(block_features_list) != len(base_dirs):
+                y_pred = np.zeros((win_h, win_w), dtype=np.uint8)
+            else:
+                X_block = np.hstack(block_features_list)
+                X_block = np.nan_to_num(X_block)
+                
+                # 差分追加
+                X_block = add_temporal_differences(X_block)
+                
+                y_pred = rf.predict(X_block)
+                y_pred = y_pred.reshape(win_h, win_w).astype(rasterio.uint8)
+                
+            dst.write(y_pred, 1, window=window)
+        
+        gc.collect()
+
+print("\n=== 全処理完了 ===")
