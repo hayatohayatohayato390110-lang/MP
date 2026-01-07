@@ -1,5 +1,5 @@
 import os
-# TensorFlowログ抑制
+# TensorFlowログ抑制 (高速化とノイズ低減)
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
@@ -19,7 +19,7 @@ import math
 from shapely.geometry import shape, Polygon, Point
 from shapely.validation import make_valid
 
-# 画像処理・機械学習
+# 画像処理・機械学習ライブラリ
 from skimage.segmentation import slic
 from skimage.measure import regionprops
 from skimage.transform import resize
@@ -30,14 +30,16 @@ import tensorflow as tf
 from tensorflow.keras.applications.inception_v3 import InceptionV3, preprocess_input
 
 # =========================================================================
-# 【設定】 Explainable Full-Spec Analysis (XAI)
+# 【設定】 True Ultimate Full-Spec XAI Edition
 # =========================================================================
-# 1. バンド設定
+
+# 1. バンド設定 (Sentinel-2 & Sentinel-1)
 TARGET_BANDS_S2 = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"]
 TARGET_BANDS_S1 = ["VV", "VH"]
 
-# 2. パス設定 (ペアリング済みリスト)
-# ※必ず「11月→3月」の順で並べてください
+# 2. パス設定 (11月 -> 3月の順でペアリング)
+
+# Sentinel-2 (光学)
 S2_DIRS = [
     r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20241114", # 11月
     r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20241219", # 12月
@@ -46,6 +48,7 @@ S2_DIRS = [
     r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20250319"  # 3月
 ]
 
+# Sentinel-1 (レーダー) ★ご指定のパスを反映
 S1_DIRS = [
     r"G:\SATELITEIMAGE\RABI\MP\2025 sentinel1\20241115", # 11月
     r"G:\SATELITEIMAGE\RABI\MP\2025 sentinel1\20241221", # 12月
@@ -54,23 +57,28 @@ S1_DIRS = [
     r"G:\SATELITEIMAGE\RABI\MP\2025 sentinel1\20250315"  # 3月
 ]
 
-MAIN_IDX = 3 # メイン時期(2月)
+# メイン時期の設定 (自動区画化の基準にする時期)
+# Index 3 = 2月 (最も植生が活性化している時期)
+MAIN_IDX = 3 
+
+# 教師データパス
 SHP_PATH = r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\multiforestbunnruidata.scpx"
 
+# 出力設定
 OUTPUT_DIR = r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2"
-OUTPUT_MAP = os.path.join(OUTPUT_DIR, "Final_XAI_Map.tif")
-OUTPUT_TABLE = os.path.join(OUTPUT_DIR, "Final_XAI_Ledger_Full.csv") # 全データ入り台帳
-OUTPUT_SUMMARY = os.path.join(OUTPUT_DIR, "Final_XAI_Class_Definition.csv") # 判断基準レポート
+OUTPUT_MAP = os.path.join(OUTPUT_DIR, "Final_Ultimate_Map.tif")        # 地図
+OUTPUT_TABLE = os.path.join(OUTPUT_DIR, "Final_Ultimate_Ledger.csv")    # 全データ台帳
+OUTPUT_SUMMARY = os.path.join(OUTPUT_DIR, "Final_Ultimate_Criteria.csv") # 判断基準レポート
 
 # 3. 解析パラメータ
-RADIUS_KM = 2.0
-UPSCALE_SIZE = 128
-APPROX_N_SEGMENTS = 4000 
-SEGMENT_COMPACTNESS = 15.0
-MAX_PIXEL_VALUE = 3000.0
-BATCH_SIZE_CNN = 32
+RADIUS_KM = 2.0         # 解析半径
+UPSCALE_SIZE = 128      # CNN入力サイズ
+APPROX_N_SEGMENTS = 4000 # 区画の細かさ
+SEGMENT_COMPACTNESS = 15.0 # 区画の形状(高いほど四角い)
+MAX_PIXEL_VALUE = 3000.0 # 固定正規化の閾値
+BATCH_SIZE_CNN = 32     # CNN推論バッチ
 
-# ★出力クラス名の定義 (教師データのIDに合わせて書き換えてください)
+# 出力クラス名の定義 (教師データのIDに合わせてください)
 CLASS_NAMES = {
     1: "Wheat (小麦)", 
     2: "Vegetables (野菜)", 
@@ -81,40 +89,44 @@ CLASS_NAMES = {
 
 # =========================================================================
 
-# --- 関数定義 (指標名キー付きで返すように変更) ---
+# --- 関数定義 ---
 
 def calc_all_indices_dict(val_dict):
-    """全指標を辞書形式で返す(CSV出力用)"""
+    """
+    全15指標 + 生バンドを計算し、学習用リストと記録用辞書を返す
+    """
     eps = 1e-6
+    # 値取り出し
     b2 = val_dict.get("B02", 0); b3 = val_dict.get("B03", 0); b4 = val_dict.get("B04", 0)
     b5 = val_dict.get("B05", 0); b6 = val_dict.get("B06", 0); b7 = val_dict.get("B07", 0)
-    b8 = val_dict.get("B08", 0); b11 = val_dict.get("B11", 0); b12 = val_dict.get("B12", 0)
+    b8 = val_dict.get("B08", 0); b8a = val_dict.get("B8A", 0); b11 = val_dict.get("B11", 0); b12 = val_dict.get("B12", 0)
     
     # 計算
     vals = {}
+    # 基本植生
     vals['NDVI'] = (b8 - b4) / (b8 + b4 + eps)
     vals['GNDVI'] = (b8 - b3) / (b8 + b3 + eps)
     knr = (b8 - b4) / (b8 + b4 + eps); vals['kNDVI'] = np.tanh(knr ** 2)
     vals['EVI'] = 2.5 * ((b8 - b4) / (b8 + 6*b4 - 7.5*b2 + 10000*eps + 1))
+    
+    # 作物特定 (RedEdge)
     vals['NDRE1'] = (b8 - b5) / (b8 + b5 + eps)
     vals['NDRE2'] = (b8 - b6) / (b8 + b6 + eps)
     vals['CI_re'] = (b8 / (b5 + eps)) - 1
     vals['MCARI'] = ((b5 - b4) - 0.2 * (b5 - b3)) * (b5 / (b4 + eps))
+    
+    # 水・水分
     vals['MNDWI'] = (b3 - b11) / (b3 + b11 + eps)
     vals['NDWI'] = (b3 - b8) / (b3 + b8 + eps)
     vals['LSWI'] = (b8 - b11) / (b8 + b11 + eps)
     vals['SWI'] = (b5 - b11) / (b5 + b11 + eps)
+    
+    # 土・都市
     vals['NDBI'] = (b11 - b8) / (b11 + b8 + eps)
     vals['BSI'] = ((b11 + b4) - (b8 + b2)) / ((b11 + b4) + (b8 + b2) + eps)
     vals['NDBSI'] = (b11 - b8) / (b11 + b8 + eps)
     
-    # 生バンドも記録
-    vals['Band_SWIR1'] = b11
-    vals['Band_NIR'] = b8
-    vals['Band_RedEdge'] = b5
-    
-    # リスト形式(学習用)と辞書形式(表示用)の両方を返す
-    # 学習用リストの順番は固定すること
+    # 学習用リスト (順序固定)
     feat_list = [
         vals['NDVI'], vals['kNDVI'], vals['GNDVI'], vals['EVI'], 
         vals['NDRE1'], vals['NDRE2'], vals['CI_re'], vals['MCARI'],
@@ -124,6 +136,7 @@ def calc_all_indices_dict(val_dict):
     return feat_list, vals
 
 def calc_bio_structural_hysteresis(time_series_means):
+    """光と構造のヒステリシス (ループ面積とラグ)"""
     if not time_series_means: return 0.0, 0.0
     x_vals = []; y_vals = []
     for t_data in time_series_means:
@@ -131,58 +144,86 @@ def calc_bio_structural_hysteresis(time_series_means):
         ndvi = (b8 - b4) / (b8 + b4 + 1e-6)
         vh = t_data.get('VH', 0)
         x_vals.append(ndvi); y_vals.append(vh)
+    
+    # 面積 (Shoelace formula)
     area = 0.0; n = len(x_vals)
     if n >= 3:
         for i in range(n):
             j = (i + 1) % n; area += x_vals[i] * y_vals[j]; area -= y_vals[i] * x_vals[j];
         area = abs(area) / 2.0
+    
+    # ラグ
     lag = np.argmax(y_vals) - np.argmax(x_vals)
     return area, lag
 
 def find_band(search_dir, band_name):
+    """ファイルの検索 (TIF優先, JP2可)"""
     pattern = os.path.join(search_dir, "**", f"*{band_name}*.tif")
     files = glob.glob(pattern, recursive=True)
     if not files:
         pattern = os.path.join(search_dir, "**", f"*{band_name}*.jp2")
         files = glob.glob(pattern, recursive=True)
     target = [f for f in files if "TCI" not in f and "PVI" not in f]
+    # S1の不要ファイルを避けるための拡張子チェック
     target = [f for f in target if f.lower().endswith('.tif') or f.lower().endswith('.jp2')]
     return target[0] if target else None
 
 # =========================================================================
 
-print("=== Explainable AI (XAI) Crop Analysis Started ===")
+print("=== True Ultimate Full-Spec Analysis System Started ===")
 
-# --- 1. パス準備 ---
+# --- 1. データパスのペアリング ---
 print("1. データリンク収集...")
-ts_paths_list = []
+
+if len(S2_DIRS) != len(S1_DIRS):
+    raise ValueError("Sentinel-2とSentinel-1のフォルダ数が一致しません。")
+
+ts_paths_list = [] # 時期ごとのパス辞書リスト
 for i in range(len(S2_DIRS)):
     period_paths = {}
+    # S2
     for b in TARGET_BANDS_S2:
-        p = find_band(S2_DIRS[i], b); 
+        p = find_band(S2_DIRS[i], b)
         if p: period_paths[b] = p
+    # S1
     for b in TARGET_BANDS_S1:
-        p = find_band(S1_DIRS[i], b); 
+        p = find_band(S1_DIRS[i], b)
         if p: period_paths[b] = p
-    if "B08" in period_paths: ts_paths_list.append(period_paths)
+    
+    if "B08" in period_paths:
+        ts_paths_list.append(period_paths)
+    else:
+        print(f"警告: 時期 {i+1} のデータが不足しています。")
 
+# メイン画像のパス
 main_paths = ts_paths_list[MAIN_IDX]
+print(f"   データセット数: {len(ts_paths_list)} 時期")
+print(f"   メイン時期: {S2_DIRS[MAIN_IDX]}")
 
 # --- 2. 画像読み込み & Auto-Segmentation ---
 print("2. 自動区画化 (Plot Generation)...")
+
 with rasterio.open(main_paths["B08"]) as src:
     profile = src.profile; transform = src.transform; crs = src.crs
+    
+    # 教師データからROI設定
     extract_dir = os.path.dirname(SHP_PATH)
     try: gdf_raw = gpd.read_file(os.path.join(extract_dir, "geometry.gpkg"))
     except: with zipfile.ZipFile(SHP_PATH, 'r') as z: z.extract("geometry.gpkg", extract_dir); gdf_raw = gpd.read_file(os.path.join(extract_dir, "geometry.gpkg"))
+    
     if gdf_raw.crs != crs: gdf_raw = gdf_raw.to_crs(crs)
     center = gdf_raw.geometry.iloc[0].centroid
-    radius_m = RADIUS_KM * 1000; minx, maxx = center.x - radius_m, center.x + radius_m; miny, maxy = center.y - radius_m, center.y + radius_m
+    radius_m = RADIUS_KM * 1000
+    minx, maxx = center.x - radius_m, center.x + radius_m
+    miny, maxy = center.y - radius_m, center.y + radius_m
     window = rasterio.windows.from_bounds(minx, miny, maxx, maxy, transform)
     win_h, win_w = int(window.height), int(window.width)
     win_transform = rasterio.windows.transform(window, transform)
 
-loaded_data = []; ts_cnn_base_imgs = []
+# メモリ展開 & CNN用画像作成
+loaded_data = [] 
+ts_cnn_base_imgs = [] 
+
 for t_idx, t_paths in enumerate(ts_paths_list):
     t_dict = {}
     for b, p in t_paths.items():
@@ -190,12 +231,16 @@ for t_idx, t_paths in enumerate(ts_paths_list):
             data = src.read(1, window=window, out_shape=(win_h, win_w), resampling=Resampling.bilinear)
             t_dict[b] = data.astype('float32')
     loaded_data.append(t_dict)
+    
+    # CNN用 (RGB合成)
     if "B08" in t_dict and "B04" in t_dict and "B03" in t_dict:
         img_t = np.dstack([t_dict["B08"], t_dict["B04"], t_dict["B03"]])
         img_t_norm = np.clip(img_t / MAX_PIXEL_VALUE, 0, 1) * 255.0
         ts_cnn_base_imgs.append(img_t_norm)
-    else: ts_cnn_base_imgs.append(np.zeros((win_h, win_w, 3), dtype=np.float32))
+    else:
+        ts_cnn_base_imgs.append(np.zeros((win_h, win_w, 3), dtype=np.float32))
 
+# Segmentation (メイン時期)
 main_stack = loaded_data[MAIN_IDX]
 seg_img = np.dstack([main_stack["B08"], main_stack["B04"], main_stack["B03"]])
 img_for_slic = np.clip(seg_img / MAX_PIXEL_VALUE, 0, 1)
@@ -204,13 +249,13 @@ props = regionprops(segments)
 print(f"   -> {len(props)} 個の区画を作成。")
 
 # --- 3. 全指標計算 & データ記録 ---
-print("3. 全数値データの抽出 & 記録 (Transparency Step)...")
+print("3. 全数値データの抽出 & 記録 (Detailed Extraction)...")
 
 inception = InceptionV3(weights='imagenet', include_top=False, input_shape=(UPSCALE_SIZE, UPSCALE_SIZE, 3), pooling='avg')
 inception.trainable = False
 
 segment_features_num = [] 
-segment_meta = [] # 台帳用の全データをここに詰め込む
+segment_meta = [] # CSV台帳用
 cnn_batches = [[] for _ in range(len(ts_paths_list))]
 segment_indices_for_cnn = []
 
@@ -222,19 +267,21 @@ for i, region in enumerate(props):
     r_idx, c_idx = coords[:, 0], coords[:, 1]
     min_r, min_c, max_r, max_c = region.bbox
     
-    # A. CNNパッチ抽出
+    # A. CNNパッチ (全時期分)
     for t_idx, base_img in enumerate(ts_cnn_base_imgs):
         patch = base_img[min_r:max_r, min_c:max_c]
-        if patch.shape[0] < 2 or patch.shape[1] < 2: patch_resized = np.zeros((UPSCALE_SIZE, UPSCALE_SIZE, 3))
-        else: patch_resized = resize(patch, (UPSCALE_SIZE, UPSCALE_SIZE), preserve_range=True)
+        if patch.shape[0] < 2 or patch.shape[1] < 2: 
+            patch_resized = np.zeros((UPSCALE_SIZE, UPSCALE_SIZE, 3))
+        else: 
+            patch_resized = resize(patch, (UPSCALE_SIZE, UPSCALE_SIZE), preserve_range=True)
         cnn_batches[t_idx].append(preprocess_input(patch_resized))
     segment_indices_for_cnn.append(i)
     
-    # B. 数値データ抽出 & 詳細記録
+    # B. 数値データ
     ts_means = []
     feat_vec = []
     
-    # CSV用のメタデータ辞書
+    # メタデータ
     pixel_count = region.area
     area_ha = (pixel_count * (10 * 10)) / 10000.0
     meta_row = {
@@ -246,56 +293,68 @@ for i, region in enumerate(props):
     
     for t_idx, t_data in enumerate(loaded_data):
         t_mean = {}
+        # ゾーン統計
         for b in (TARGET_BANDS_S2 + TARGET_BANDS_S1):
             if b in t_data: t_mean[b] = np.mean(t_data[b][r_idx, c_idx])
             else: t_mean[b] = 0.0
         ts_means.append(t_mean)
         
-        # 指標計算 (辞書で取得してCSVにも記録)
+        # 指標計算
         indices_list, indices_dict = calc_all_indices_dict(t_mean)
         
-        # 生データ + 指標を特徴ベクトルへ
-        feat_vec.extend([t_mean.get("B08",0), t_mean.get("B11",0), t_mean.get("VH",0)])
+        # ★重要修正: B12, VH も学習データに含める
+        feat_vec.extend([
+            t_mean.get("B08",0), # NIR
+            t_mean.get("B11",0), # SWIR1
+            t_mean.get("B12",0), # SWIR2 (追加)
+            t_mean.get("VH",0),  # VH (追加)
+            t_mean.get("VV",0)   # VV (追加)
+        ])
         feat_vec.extend(indices_list)
         
-        # ★ここがポイント: CSV用にすべての値を記録 (例: "Nov_NDVI", "Jan_VH"...)
-        month_prefix = f"T{t_idx+1}" # T1(11月)...T5(3月)
+        # CSV記録 (全データ)
+        month_prefix = f"T{t_idx+1}"
         for k, v in indices_dict.items():
             meta_row[f"{month_prefix}_{k}"] = round(float(v), 4)
         meta_row[f"{month_prefix}_VH"] = round(float(t_mean.get("VH", 0)), 4)
-        meta_row[f"{month_prefix}_VV"] = round(float(t_mean.get("VV", 0)), 4)
+        meta_row[f"{month_prefix}_B12"] = round(float(t_mean.get("B12", 0)), 4)
     
+    # ヒステリシス計算
     hyst_area, hyst_lag = calc_bio_structural_hysteresis(ts_means)
     feat_vec.extend([hyst_area, hyst_lag])
     segment_features_num.append(feat_vec)
     
-    # ヒステリシス情報もCSVへ
     meta_row['Hysteresis_Area'] = round(hyst_area, 4)
     meta_row['Hysteresis_Lag'] = int(hyst_lag)
-    
     segment_meta.append(meta_row)
 
-# CNN推論
-print("   CNN特徴抽出中...")
+# CNN推論 (時期ごとにバッチ実行)
+print("   時系列CNN特徴を抽出中 (Deep Feature Extraction)...")
 segment_cnn_features = []
 temp_cnn_feats = [[] for _ in range(len(ts_paths_list))]
+
 for t_idx, batch_imgs in enumerate(cnn_batches):
     if not batch_imgs: continue
-    print(f"   Step {t_idx+1}...", end="\r")
+    print(f"   Time Step {t_idx+1} predicting...", end="\r")
     preds = inception.predict(np.array(batch_imgs), batch_size=BATCH_SIZE_CNN, verbose=0)
     temp_cnn_feats[t_idx] = preds
-print("\n   結合中...")
+
+print("\n   特徴結合中...")
 for i in range(len(segment_indices_for_cnn)):
+    # 5時期分のCNN特徴(2048*5)を結合
     stacked = np.concatenate([temp_cnn_feats[t][i] for t in range(len(ts_paths_list))])
     segment_cnn_features.append(stacked)
 
+# 数値特徴と画像特徴を結合
 X_all = np.concatenate([np.array(segment_cnn_features), np.array(segment_features_num)], axis=1)
+print(f"   全特徴量次元数: {X_all.shape[1]}")
 
-# --- 4. 学習 ---
+# --- 4. 学習 (SVM) ---
 print("4. 学習 (Teacher Matching)...")
 target_col = next((c for c in ['class_id', 'macroclass_id', 'C_ID'] if c in gdf_raw.columns), gdf_raw.columns[0])
 X_train, y_train = [], []
 train_indices = set()
+
 for idx, row in gdf_raw.iterrows():
     label = int(row[target_col]); t_center = row.geometry.centroid
     py, px = ~win_transform * (t_center.x, t_center.y); py, px = int(py), int(px)
@@ -308,13 +367,15 @@ for idx, row in gdf_raw.iterrows():
 X_train = np.array(X_train); y_train = np.array(y_train)
 
 if len(y_train) > 0:
+    print(f"   学習データ数: {len(y_train)}")
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
+    # クラスの偏りを補正して学習
     svm = SVC(kernel='rbf', C=10.0, class_weight='balanced', probability=False)
     svm.fit(X_train_scaled, y_train)
     
-    # --- 5. 結果出力 & 判断基準レポート作成 ---
-    print("5. 結果集計 & レポート作成...")
+    # --- 5. 結果出力 ---
+    print("5. 推論 & レポート作成...")
     X_all_scaled = scaler.transform(X_all)
     preds = svm.predict(X_all_scaled)
     
@@ -322,51 +383,48 @@ if len(y_train) > 0:
     
     for i, item in enumerate(segment_meta):
         pred_label = preds[i]
-        # ★名前で記録
-        class_name = CLASS_NAMES.get(pred_label, f"Unknown_{pred_label}")
+        # クラス名取得
+        class_name = CLASS_NAMES.get(pred_label, f"Class_{pred_label}")
         
         row = item.copy()
-        row['Final_Class'] = class_name # Wheat, Forestなどを書き込む
+        row['Final_Class'] = class_name
         del row['idx']; del row['id']
         csv_rows.append(row)
         lut[item['id']] = pred_label
 
-    # A. 全台帳保存
+    # 台帳保存
     df_result = pd.DataFrame(csv_rows)
-    # カラム順序を整理 (ID, Class, Area, その後に数値データ)
     cols = ['Plot_ID', 'Final_Class', 'Area_ha', 'Hysteresis_Area'] + [c for c in df_result.columns if c not in ['Plot_ID', 'Final_Class', 'Area_ha', 'Hysteresis_Area']]
     df_result = df_result[cols]
     df_result.to_csv(OUTPUT_TABLE, index=False, encoding='utf-8-sig')
     
-    # B. 判断基準レポート (Summary) 作成
-    print("   ★判断基準(範囲)を逆算中...")
-    # クラスごとにグループ化し、各指標の [Min, Mean, Max] を計算
+    # 判断基準レポート作成
+    print("   ★判断基準(Statistical Criteria)を算出中...")
     summary_dfs = []
-    
-    # 分析対象のカラム（T1_NDVIなどを抽出）
-    target_cols = [c for c in df_result.columns if "NDVI" in c or "VH" in c or "SWIR" in c or "Hysteresis" in c]
-    
+    # 重要指標に絞って要約
+    target_cols = [c for c in df_result.columns if ("NDVI" in c and "T4" in c) or "Hysteresis" in c or "VH" in c]
+    if not target_cols: target_cols = [c for c in df_result.columns if "NDVI" in c] # fallback
+
     for cls_name, group in df_result.groupby("Final_Class"):
-        desc = group[target_cols].describe().T[['min', 'mean', 'max']]
-        desc['Class'] = cls_name
-        summary_dfs.append(desc)
+        if target_cols:
+            desc = group[target_cols].describe().T[['min', 'mean', 'max']]
+            desc['Class'] = cls_name
+            summary_dfs.append(desc)
     
     if summary_dfs:
-        df_summary = pd.concat(summary_dfs)
-        df_summary = df_summary.reset_index().rename(columns={'index': 'Indicator'})
-        # 見やすい順に並べ替え
+        df_summary = pd.concat(summary_dfs).reset_index().rename(columns={'index': 'Indicator'})
         df_summary = df_summary[['Class', 'Indicator', 'min', 'mean', 'max']]
         df_summary.to_csv(OUTPUT_SUMMARY, index=False, encoding='utf-8-sig')
 
-    # C. 地図保存
+    # 地図保存
     final_map = lut[segments]
     profile.update(height=win_h, width=win_w, transform=win_transform, count=1, dtype=rasterio.uint8)
     with rasterio.open(OUTPUT_MAP, 'w', **profile) as dst: dst.write(final_map, 1)
         
     print("=== 全処理完了 ===")
-    print(f"詳細台帳CSV: {OUTPUT_TABLE}")
-    print(f"判断基準レポート: {OUTPUT_SUMMARY}")
+    print(f"詳細台帳: {OUTPUT_TABLE}")
+    print(f"基準レポート: {OUTPUT_SUMMARY}")
     print(f"分類地図: {OUTPUT_MAP}")
-    print("-> レポート(Summary)を見ると、「小麦(Wheat)と判定された区画のNDVIは0.X〜0.Yだった」という事実が確認できます。")
 
-else: print("エラー: 学習データなし")
+else:
+    print("エラー: 学習データが抽出できませんでした。Shapefileの位置を確認してください。")
