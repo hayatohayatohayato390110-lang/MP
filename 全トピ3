@@ -1,0 +1,274 @@
+import os
+# TensorFlowログ抑制
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+import rasterio
+from rasterio.windows import Window
+from rasterio.enums import Resampling
+from rasterio.features import shapes
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+import glob
+import random
+import time
+import zipfile
+import gc
+import math
+from shapely.geometry import shape, Polygon, Point
+from shapely.validation import make_valid
+
+# 画像処理・機械学習
+from skimage.segmentation import slic
+from skimage.measure import regionprops
+from skimage.transform import resize
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+import tensorflow as tf
+from tensorflow.keras.applications.inception_v3 import InceptionV3, preprocess_input
+
+# =========================================================================
+# 【設定】 True Ultimate Full-Spec (Temporal CNN Texture Included)
+# =========================================================================
+# 1. バンド設定
+TARGET_BANDS_S2 = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"]
+TARGET_BANDS_S1 = ["VV", "VH"]
+
+# 2. パス設定
+SHP_PATH = r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\multiforestbunnruidata.scpx"
+MAIN_IMAGE_DIR = r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20250202" # メイン時期(セグメンテーション用)
+SAFE_DIRS = [
+    r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20241114",
+    r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20241219",
+    r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20250118",
+    r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20250202",
+    r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20250319"
+]
+OUTPUT_DIR = r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2"
+OUTPUT_MAP = os.path.join(OUTPUT_DIR, "Final_True_Ultimate_Map.tif")
+OUTPUT_TABLE = os.path.join(OUTPUT_DIR, "Final_True_Ultimate_Ledger.csv")
+
+# 3. 解析パラメータ
+RADIUS_KM = 2.0
+UPSCALE_SIZE = 128
+APPROX_N_SEGMENTS = 4000 
+SEGMENT_COMPACTNESS = 15.0
+MAX_PIXEL_VALUE = 3000.0
+BATCH_SIZE_CNN = 32 # CNNのバッチサイズ
+
+# =========================================================================
+# (指標計算関数などは直前のコードと同じなので省略し、変更点のみ記載します)
+# ※実際の実行時には、直前のコードの calc_all_indices_extended, calc_bio_structural_hysteresis, find_band をここにコピーしてください。
+# =========================================================================
+
+# ... (ここに calc_all_indices_extended などを貼り付け) ...
+# ... (ここに calc_bio_structural_hysteresis などを貼り付け) ...
+# ... (ここに find_band などを貼り付け) ...
+
+def calc_all_indices_extended(val_dict):    eps = 1e-6; b2 = val_dict.get("B02", 0); b3 = val_dict.get("B03", 0); b4 = val_dict.get("B04", 0); b5 = val_dict.get("B05", 0); b6 = val_dict.get("B06", 0); b7 = val_dict.get("B07", 0); b8 = val_dict.get("B08", 0); b8a = val_dict.get("B8A", 0); b11 = val_dict.get("B11", 0); b12 = val_dict.get("B12", 0); ndvi = (b8 - b4) / (b8 + b4 + eps); gndvi = (b8 - b3) / (b8 + b3 + eps); knr = (b8 - b4) / (b8 + b4 + eps); kndvi = np.tanh(knr ** 2); evi = 2.5 * ((b8 - b4) / (b8 + 6*b4 - 7.5*b2 + 10000*eps + 1)); ndre1 = (b8 - b5) / (b8 + b5 + eps); ndre2 = (b8 - b6) / (b8 + b6 + eps); ci_re = (b8 / (b5 + eps)) - 1; mcari = ((b5 - b4) - 0.2 * (b5 - b3)) * (b5 / (b4 + eps)); mndwi = (b3 - b11) / (b3 + b11 + eps); ndwi = (b3 - b8) / (b3 + b8 + eps); lswi = (b8 - b11) / (b8 + b11 + eps); swi = (b5 - b11) / (b5 + b11 + eps); ndbi = (b11 - b8) / (b11 + b8 + eps); bsi = ((b11 + b4) - (b8 + b2)) / ((b11 + b4) + (b8 + b2) + eps); ndbsi = (b11 - b8) / (b11 + b8 + eps); return [ndvi, kndvi, gndvi, evi, ndre1, ndre2, ci_re, mcari, mndwi, ndwi, lswi, swi, ndbi, bsi, ndbsi]
+def calc_bio_structural_hysteresis(time_series_means):    if not time_series_means: return 0.0, 0.0; x_vals = []; y_vals = [];    for t_data in time_series_means:        b8 = t_data.get('B08', 0); b4 = t_data.get('B04', 0); ndvi = (b8 - b4) / (b8 + b4 + 1e-6); vh = t_data.get('VH', 0); x_vals.append(ndvi); y_vals.append(vh);    area = 0.0; n = len(x_vals);    if n >= 3:        for i in range(n):            j = (i + 1) % n; area += x_vals[i] * y_vals[j]; area -= y_vals[i] * x_vals[j];        area = abs(area) / 2.0;    lag = np.argmax(y_vals) - np.argmax(x_vals); return area, lag
+def find_band(search_dir, band_name):    pattern = os.path.join(search_dir, "**", f"*{band_name}*.tif"); files = glob.glob(pattern, recursive=True);    if not files:        pattern = os.path.join(search_dir, "**", f"*{band_name}*.jp2"); files = glob.glob(pattern, recursive=True);    target = [f for f in files if "TCI" not in f and "PVI" not in f]; return target[0] if target else None
+
+print("=== True Ultimate Full-Spec Analysis (Temporal CNN) Started ===")
+
+# --- 4. データ準備 (省略なし) ---
+print("1. データリンク収集...")
+main_paths = {}
+for b in TARGET_BANDS_S2 + TARGET_BANDS_S1:
+    p = find_band(MAIN_IMAGE_DIR, b)
+    if p: main_paths[b] = p
+if "B08" not in main_paths: raise FileNotFoundError("メイン時期のB08が見つかりません")
+
+ts_paths_list = []
+for d in SAFE_DIRS:
+    found = {}
+    for b in TARGET_BANDS_S2 + TARGET_BANDS_S1:
+        p = find_band(d, b)
+        if p: found[b] = p
+    if "B08" in found: ts_paths_list.append(found)
+
+# --- 5. 画像読み込み & Auto-Segmentation ---
+print("2. 画像読み込み & 自動区画化...")
+with rasterio.open(main_paths["B08"]) as src:
+    profile = src.profile; transform = src.transform; crs = src.crs
+    extract_dir = os.path.dirname(SHP_PATH)
+    try: gdf_raw = gpd.read_file(os.path.join(extract_dir, "geometry.gpkg"))
+    except: with zipfile.ZipFile(SHP_PATH, 'r') as z: z.extract("geometry.gpkg", extract_dir); gdf_raw = gpd.read_file(os.path.join(extract_dir, "geometry.gpkg"))
+    if gdf_raw.crs != crs: gdf_raw = gdf_raw.to_crs(crs)
+    center = gdf_raw.geometry.iloc[0].centroid
+    radius_m = RADIUS_KM * 1000; minx, maxx = center.x - radius_m, center.x + radius_m; miny, maxy = center.y - radius_m, center.y + radius_m
+    window = rasterio.windows.from_bounds(minx, miny, maxx, maxy, transform)
+    win_h, win_w = int(window.height), int(window.width)
+    win_transform = rasterio.windows.transform(window, transform)
+
+# メモリ展開 & CNN用ベース画像作成
+loaded_data = [] 
+main_stack = {}
+# ★変更点: 各時期のCNN用ベース画像を保持するリスト
+ts_cnn_base_imgs = [] 
+
+for t_idx, t_paths in enumerate(ts_paths_list):
+    t_dict = {}
+    for b, p in t_paths.items():
+        with rasterio.open(p) as src:
+            data = src.read(1, window=window, out_shape=(win_h, win_w), resampling=Resampling.bilinear)
+            t_dict[b] = data.astype('float32')
+            if p == main_paths.get(b): main_stack[b] = data.astype('float32')
+    loaded_data.append(t_dict)
+
+    # ★追加: この時期のCNN用画像(RGB合成+正規化)を作成
+    # S2データが揃っている前提
+    if "B08" in t_dict and "B04" in t_dict and "B03" in t_dict:
+        img_t = np.dstack([t_dict["B08"], t_dict["B04"], t_dict["B03"]])
+        img_t_norm = np.clip(img_t / MAX_PIXEL_VALUE, 0, 1) * 255.0 # 0-255スケール
+        ts_cnn_base_imgs.append(img_t_norm)
+    else:
+        # データ欠損時は黒画像で埋める(エラー回避)
+        ts_cnn_base_imgs.append(np.zeros((win_h, win_w, 3), dtype=np.float32))
+
+# Segmentation (メイン時期で実行)
+seg_img = np.dstack([main_stack["B08"], main_stack["B04"], main_stack["B03"]])
+img_for_slic = np.clip(seg_img / MAX_PIXEL_VALUE, 0, 1)
+segments = slic(img_for_slic, n_segments=APPROX_N_SEGMENTS, compactness=SEGMENT_COMPACTNESS, sigma=1.0, start_label=1)
+props = regionprops(segments)
+print(f"   -> {len(props)} 個の区画を作成。")
+
+# --- 6. 区画解析 (Temporal CNN + Full Indices) ---
+print("3. 全指標計算 & 時系列CNNテクスチャ抽出...")
+
+inception = InceptionV3(weights='imagenet', include_top=False, input_shape=(UPSCALE_SIZE, UPSCALE_SIZE, 3), pooling='avg')
+inception.trainable = False
+
+segment_features_num = [] # 数値特徴量
+segment_meta = [] 
+
+# CNNバッチ処理用: 時期ごとのリストを作成
+# cnn_batches[time_idx] = [patch1, patch2, ...]
+cnn_batches = [[] for _ in range(len(ts_paths_list))]
+segment_indices_for_cnn = [] # どの区画か記録
+
+start_time = time.time()
+
+for i, region in enumerate(props):
+    label_id = region.label
+    coords = region.coords
+    r_idx, c_idx = coords[:, 0], coords[:, 1]
+    min_r, min_c, max_r, max_c = region.bbox
+    
+    # --- A. Temporal CNN Feature (Texture) ---
+    # ★変更点: 全時期の画像からパッチを切り出す
+    for t_idx, base_img in enumerate(ts_cnn_base_imgs):
+        patch = base_img[min_r:max_r, min_c:max_c]
+        # パッチが小さすぎる場合のエラー回避
+        if patch.shape[0] < 2 or patch.shape[1] < 2:
+             patch_resized = np.zeros((UPSCALE_SIZE, UPSCALE_SIZE, 3))
+        else:
+             patch_resized = resize(patch, (UPSCALE_SIZE, UPSCALE_SIZE), preserve_range=True)
+        
+        patch_pre = preprocess_input(patch_resized)
+        cnn_batches[t_idx].append(patch_pre)
+        
+    segment_indices_for_cnn.append(i)
+    
+    # --- B. Numerical Features ---
+    ts_means = []
+    feat_vec = []
+    for t_data in loaded_data:
+        t_mean = {}
+        for b in (TARGET_BANDS_S2 + TARGET_BANDS_S1):
+            if b in t_data:
+                t_mean[b] = np.mean(t_data[b][r_idx, c_idx])
+            else:
+                t_mean[b] = 0.0
+        ts_means.append(t_mean)
+        indices = calc_all_indices_extended(t_mean)
+        feat_vec.extend([t_mean.get("B08",0), t_mean.get("B11",0), t_mean.get("VH",0)])
+        feat_vec.extend(indices)
+    
+    hyst_area, hyst_lag = calc_bio_structural_hysteresis(ts_means)
+    feat_vec.extend([hyst_area, hyst_lag])
+    segment_features_num.append(feat_vec)
+    
+    # Meta data
+    pixel_count = region.area
+    area_ha = (pixel_count * (10 * 10)) / 10000.0
+    segment_meta.append({'Plot_ID': f"P-{label_id:04d}", 'Area_ha': round(area_ha, 3), 'Hysteresis': round(hyst_area, 4), 'idx': i, 'id': label_id})
+
+# CNN推論 (時期ごとにバッチ実行して結合)
+print("   時系列CNN特徴を抽出中 (重い処理)...")
+segment_cnn_features = []
+
+# 各時期の特徴量を保持する一時リスト
+# temp_cnn_feats[time_idx][segment_idx] = 2048次元ベクトル
+temp_cnn_feats = [[] for _ in range(len(ts_paths_list))]
+
+for t_idx, batch_imgs in enumerate(cnn_batches):
+    if not batch_imgs: continue
+    print(f"   Time step {t_idx+1}/{len(ts_paths_list)} predicting...", end="\r")
+    imgs_arr = np.array(batch_imgs)
+    # バッチサイズで分割して推論
+    preds = inception.predict(imgs_arr, batch_size=BATCH_SIZE_CNN, verbose=0)
+    temp_cnn_feats[t_idx] = preds
+
+print("\n   CNN特徴結合中...")
+num_segments = len(segment_indices_for_cnn)
+for i in range(num_segments):
+    # この区画の全時期のCNN特徴を横につなげる
+    # shape: (2048 * 時期数, )
+    stacked_cnn_feat = np.concatenate([temp_cnn_feats[t][i] for t in range(len(ts_paths_list))])
+    segment_cnn_features.append(stacked_cnn_feat)
+
+# 全特徴量結合 (Numerical + Temporal CNN)
+X_all = np.concatenate([np.array(segment_cnn_features), np.array(segment_features_num)], axis=1)
+print(f"   全特徴量抽出完了: 次元数 {X_all.shape[1]} (うちCNN: {len(ts_paths_list)*2048})")
+
+# --- 7. 学習 (SVM) ---
+print("4. 教師データマッチング & 学習...")
+target_col = next((c for c in ['class_id', 'macroclass_id', 'C_ID'] if c in gdf_raw.columns), gdf_raw.columns[0])
+
+X_train, y_train = [], []
+train_indices = set()
+
+for idx, row in gdf_raw.iterrows():
+    label = int(row[target_col]); t_center = row.geometry.centroid
+    py, px = ~win_transform * (t_center.x, t_center.y); py, px = int(py), int(px)
+    if 0 <= py < win_h and 0 <= px < win_w:
+        seg_id = segments[py, px]
+        found = next((item for item in segment_meta if item['id'] == seg_id), None)
+        if found and found['idx'] not in train_indices:
+            X_train.append(X_all[found['idx']]); y_train.append(label); train_indices.add(found['idx'])
+
+X_train = np.array(X_train); y_train = np.array(y_train)
+
+if len(y_train) > 0:
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    svm = SVC(kernel='rbf', C=10.0, class_weight='balanced', probability=False)
+    svm.fit(X_train_scaled, y_train)
+    
+    # --- 8. 推論 & 保存 ---
+    print("5. 推論 & 結果出力...")
+    X_all_scaled = scaler.transform(X_all)
+    preds = svm.predict(X_all_scaled)
+    
+    csv_rows = []; lut = np.zeros(segments.max() + 1, dtype=np.uint8)
+    class_map = {1: "Wheat", 2: "Vegetables", 3: "Forest", 4: "Grassland", 5: "Soil/Fallow"} # 要調整
+
+    for i, item in enumerate(segment_meta):
+        pred_label = preds[i]
+        class_name = class_map.get(pred_label, f"Class_{pred_label}")
+        row = item.copy(); row['Final_Class'] = class_name; del row['idx']; del row['id']
+        csv_rows.append(row); lut[item['id']] = pred_label
+        
+    df_result = pd.DataFrame(csv_rows)
+    df_result.to_csv(OUTPUT_TABLE, index=False, encoding='utf-8-sig')
+    final_map = lut[segments]
+    profile.update(height=win_h, width=win_w, transform=win_transform, count=1, dtype=rasterio.uint8)
+    with rasterio.open(OUTPUT_MAP, 'w', **profile) as dst: dst.write(final_map, 1)
+        
+    print("=== 真・完全版解析完了 ===")
+    print(f"台帳: {OUTPUT_TABLE}")
+    print(f"地図: {OUTPUT_MAP}")
+else: print("学習データ不足エラー")
