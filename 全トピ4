@@ -1,0 +1,485 @@
+import os
+# TensorFlowログ抑制
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+import rasterio
+from rasterio.windows import Window
+from rasterio.enums import Resampling
+from rasterio.vrt import WarpedVRT
+from rasterio.features import shapes
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+import glob
+import time
+import zipfile
+import gc
+from shapely.geometry import box, shape
+from skimage.segmentation import slic
+from skimage.measure import regionprops
+from skimage.transform import resize
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+import tensorflow as tf
+from tensorflow.keras.applications.inception_v3 import InceptionV3, preprocess_input
+
+# =========================================================================
+# 【設定】 Final Integrated 30km Analysis (Tile + XAI + Full Specs)
+# =========================================================================
+
+# 1. バンド設定
+TARGET_BANDS_S2 = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"]
+TARGET_BANDS_S1 = ["VV", "VH"]
+
+# 2. パス設定 (11月 -> 3月の順に整列済み)
+S2_DIRS = [
+    r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20241114", # 11月
+    r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20241219", # 12月
+    r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20250118", # 1月
+    r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20250202", # 2月 (メイン)
+    r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\20250319"  # 3月
+]
+
+# ★ご指定のSentinel-1パスを日付順にソートして適用
+S1_DIRS = [
+    r"G:\SATELITEIMAGE\RABI\MP\2025 sentinel1\20241115", # 11月
+    r"G:\SATELITEIMAGE\RABI\MP\2025 sentinel1\20241221", # 12月
+    r"G:\SATELITEIMAGE\RABI\MP\2025 sentinel1\20250114", # 1月
+    r"G:\SATELITEIMAGE\RABI\MP\2025 sentinel1\20250207", # 2月 (メイン)
+    r"G:\SATELITEIMAGE\RABI\MP\2025 sentinel1\20250315"  # 3月
+]
+
+MAIN_IDX = 3 # 2月を基準
+SHP_PATH = r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2\multiforestbunnruidata.scpx"
+
+# 出力設定
+OUTPUT_DIR = r"G:\SATELITEIMAGE\RABI\MP\2025SENTINEL2"
+OUTPUT_MAP = os.path.join(OUTPUT_DIR, "Final_30km_Map.tif")
+OUTPUT_TABLE = os.path.join(OUTPUT_DIR, "Final_30km_Ledger.csv")
+OUTPUT_SUMMARY = os.path.join(OUTPUT_DIR, "Final_30km_Criteria.csv")
+
+# 3. 解析パラメータ
+RADIUS_KM = 30.0        # 半径30km (広域)
+TILE_SIZE = 2048        # タイル分割サイズ (メモリ対策)
+APPROX_N_SEGMENTS_PER_TILE = 2000 
+SEGMENT_COMPACTNESS = 15.0
+MAX_PIXEL_VALUE = 3000.0
+UPSCALE_SIZE = 128      # CNN入力サイズ
+BATCH_SIZE_CNN = 32
+
+# クラス定義
+CLASS_NAMES = {
+    1: "Wheat (小麦)", 2: "Vegetables (野菜)", 3: "Forest (森林)", 
+    4: "Grassland (草原)", 5: "Soil/Fallow (休耕地)"
+}
+
+# =========================================================================
+
+# --- 関数定義 ---
+
+def find_band(search_dir, band_name):
+    pattern = os.path.join(search_dir, "**", f"*{band_name}*.tif")
+    files = glob.glob(pattern, recursive=True)
+    if not files:
+        pattern = os.path.join(search_dir, "**", f"*{band_name}*.jp2")
+        files = glob.glob(pattern, recursive=True)
+    target = [f for f in files if "TCI" not in f and "PVI" not in f]
+    target = [f for f in target if f.lower().endswith('.tif') or f.lower().endswith('.jp2')]
+    return target[0] if target else None
+
+def calc_all_indices_dict(val_dict):
+    """全指標計算 (SWI, kNDVI, LSWI等含む完全版)"""
+    eps = 1e-6
+    # 値取り出し
+    b2=val_dict.get("B02",0); b3=val_dict.get("B03",0); b4=val_dict.get("B04",0)
+    b5=val_dict.get("B05",0); b6=val_dict.get("B06",0); b8=val_dict.get("B08",0)
+    b11=val_dict.get("B11",0); b12=val_dict.get("B12",0)
+    
+    vals = {}
+    # 基本植生
+    vals['NDVI'] = (b8 - b4) / (b8 + b4 + eps)
+    vals['GNDVI'] = (b8 - b3) / (b8 + b3 + eps)
+    knr = (b8 - b4) / (b8 + b4 + eps); vals['kNDVI'] = np.tanh(knr ** 2) # kNDVI
+    vals['EVI'] = 2.5 * ((b8 - b4) / (b8 + 6*b4 - 7.5*b2 + 10000*eps + 1))
+    
+    # 作物特定
+    vals['NDRE1'] = (b8 - b5) / (b8 + b5 + eps)
+    vals['NDRE2'] = (b8 - b6) / (b8 + b6 + eps)
+    vals['CI_re'] = (b8 / (b5 + eps)) - 1
+    vals['MCARI'] = ((b5 - b4) - 0.2 * (b5 - b3)) * (b5 / (b4 + eps))
+    
+    # 水・水分
+    vals['MNDWI'] = (b3 - b11) / (b3 + b11 + eps)
+    vals['NDWI'] = (b3 - b8) / (b3 + b8 + eps)
+    vals['LSWI'] = (b8 - b11) / (b8 + b11 + eps) # LSWI
+    vals['SWI'] = (b5 - b11) / (b5 + b11 + eps)   # SWI
+    
+    # 土・都市
+    vals['NDBI'] = (b11 - b8) / (b11 + b8 + eps)
+    vals['BSI'] = ((b11 + b4) - (b8 + b2)) / ((b11 + b4) + (b8 + b2) + eps)
+    vals['NDBSI'] = (b11 - b8) / (b11 + b8 + eps) # NDBSI
+    
+    # リスト形式 (学習用)
+    feat_list = [
+        vals['NDVI'], vals['kNDVI'], vals['GNDVI'], vals['EVI'], 
+        vals['NDRE1'], vals['NDRE2'], vals['CI_re'], vals['MCARI'],
+        vals['MNDWI'], vals['NDWI'], vals['LSWI'], vals['SWI'],
+        vals['NDBI'], vals['BSI'], vals['NDBSI']
+    ]
+    return feat_list, vals
+
+def calc_bio_structural_hysteresis(time_series_means):
+    """光と構造のヒステリシス"""
+    if not time_series_means: return 0.0, 0.0
+    x, y = [], []
+    for t in time_series_means:
+        b8=t.get('B08',0); b4=t.get('B04',0); vh=t.get('VH',0)
+        ndvi = (b8-b4)/(b8+b4+1e-6)
+        x.append(ndvi); y.append(vh)
+    area = 0.0; n = len(x)
+    if n >= 3:
+        for i in range(n):
+            j = (i+1)%n; area += x[i]*y[j]; area -= y[i]*x[j]
+        area = abs(area)/2.0
+    lag = np.argmax(y) - np.argmax(x)
+    return area, lag
+
+# =========================================================================
+
+print("=== Final Integrated 30km Analysis System Started ===")
+
+# --- 1. データパス収集 & 範囲確定 ---
+print("1. データリンク収集 & 30km範囲計算...")
+
+if len(S2_DIRS) != len(S1_DIRS): raise ValueError("フォルダ数不一致")
+
+ts_paths_list = []
+for i in range(len(S2_DIRS)):
+    p_paths = {}
+    for b in TARGET_BANDS_S2:
+        p = find_band(S2_DIRS[i], b); 
+        if p: p_paths[b] = p
+    for b in TARGET_BANDS_S1:
+        p = find_band(S1_DIRS[i], b); 
+        if p: p_paths[b] = p
+    if "B08" in p_paths: ts_paths_list.append(p_paths)
+
+main_paths = ts_paths_list[MAIN_IDX]
+
+# 30km範囲の計算
+with rasterio.open(main_paths["B08"]) as src_main:
+    main_crs = src_main.crs
+    main_transform = src_main.transform
+    main_bounds = src_main.bounds
+    main_width = src_main.width
+    main_height = src_main.height
+    
+    extract_dir = os.path.dirname(SHP_PATH)
+    try: gdf_raw = gpd.read_file(os.path.join(extract_dir, "geometry.gpkg"))
+    except: with zipfile.ZipFile(SHP_PATH, 'r') as z: z.extract("geometry.gpkg", extract_dir); gdf_raw = gpd.read_file(os.path.join(extract_dir, "geometry.gpkg"))
+    if gdf_raw.crs != main_crs: gdf_raw = gdf_raw.to_crs(main_crs)
+    center = gdf_raw.geometry.iloc[0].centroid
+    
+    roi_minx = center.x - (RADIUS_KM * 1000); roi_maxx = center.x + (RADIUS_KM * 1000)
+    roi_miny = center.y - (RADIUS_KM * 1000); roi_maxy = center.y + (RADIUS_KM * 1000)
+    roi_box = box(roi_minx, roi_miny, roi_maxx, roi_maxy)
+    
+    # 画像との共通範囲
+    img_box = box(main_bounds.left, main_bounds.bottom, main_bounds.right, main_bounds.top)
+    valid_intersection = roi_box.intersection(img_box)
+    if valid_intersection.is_empty: raise ValueError("30km範囲が画像外です")
+    
+    final_bounds = valid_intersection.bounds
+    full_window = rasterio.windows.from_bounds(*final_bounds, transform=main_transform)
+    full_window = full_window.round_offsets().round_shape()
+    full_w, full_h = int(full_window.width), int(full_window.height)
+    print(f"   解析対象: {full_w} x {full_h} ピクセル (Tiles: {TILE_SIZE}px)")
+
+# --- 2. タイル分割処理 (特徴量抽出) ---
+print("2. タイル分割処理開始 (全指標・全時期計算)...")
+
+inception = InceptionV3(weights='imagenet', include_top=False, input_shape=(UPSCALE_SIZE, UPSCALE_SIZE, 3), pooling='avg')
+inception.trainable = False
+
+# 結果蓄積用リスト (メモリ対策のため特徴量だけ保持)
+all_segment_features = [] # [features]
+all_segment_meta = [] # [metadata]
+all_segment_geoms = [] # [geometry] - 最後のマップ構築には使わないが教師マッチングに必要
+global_segment_id_counter = 0
+
+# マップ再構築用: タイルごとのセグメントID画像と、そのIDが指すグローバルIDの対応表が必要
+# しかし30km規模だとセグメント数が膨大(数万〜数十万)になるため、
+# シンプルに「学習データ抽出」と「推論＆書き込み」を分けるべきだが、
+# 今回は「一度全特徴量を抽出 -> 学習 -> 全推論 -> もう一度タイルループして書き込み」とする
+
+# タイルループ
+for r_off in range(0, full_h, TILE_SIZE):
+    for c_off in range(0, full_w, TILE_SIZE):
+        width = min(TILE_SIZE, full_w - c_off)
+        height = min(TILE_SIZE, full_h - r_off)
+        abs_col = full_window.col_off + c_off
+        abs_row = full_window.row_off + r_off
+        win = Window(abs_col, abs_row, width, height)
+        win_transform = rasterio.windows.transform(win, main_transform)
+        
+        print(f"   Processing Tile {r_off},{c_off}...", end="\r")
+
+        # データロード (全時期)
+        tile_loaded = []
+        tile_cnn_base = []
+        skip_tile = False
+        
+        try:
+            for t_idx, t_paths in enumerate(ts_paths_list):
+                t_dict = {}
+                for b, p in t_paths.items():
+                    with rasterio.open(p) as src:
+                        # ★WarpedVRTで位置補正
+                        with WarpedVRT(src, crs=main_crs, transform=main_transform, width=main_width, height=main_height) as vrt:
+                            data = vrt.read(1, window=win, out_shape=(height, width), resampling=Resampling.bilinear)
+                            t_dict[b] = data.astype('float32')
+                tile_loaded.append(t_dict)
+                
+                # CNN画像作成
+                if "B08" in t_dict:
+                    img_t = np.dstack([t_dict.get("B08"), t_dict.get("B04", t_dict["B08"]), t_dict.get("B03", t_dict["B08"])])
+                    img_t_norm = np.clip(img_t / MAX_PIXEL_VALUE, 0, 1) * 255.0
+                    tile_cnn_base.append(img_t_norm)
+                else:
+                    tile_cnn_base.append(np.zeros((height, width, 3), dtype=np.float32))
+        except Exception as e:
+            print(f"Tile Error: {e}")
+            continue
+
+        # セグメンテーション
+        main_stack = tile_loaded[MAIN_IDX]
+        if "B08" not in main_stack: continue
+        seg_img = np.dstack([main_stack["B08"], main_stack.get("B04", main_stack["B08"]), main_stack.get("B03", main_stack["B08"])])
+        img_norm = np.clip(seg_img / MAX_PIXEL_VALUE, 0, 1)
+        segments = slic(img_norm, n_segments=APPROX_N_SEGMENTS_PER_TILE, compactness=SEGMENT_COMPACTNESS, start_label=1)
+        props = regionprops(segments)
+        
+        # 特徴抽出
+        cnn_batches = [[] for _ in range(len(ts_paths_list))]
+        seg_indices = []
+        
+        for i, region in enumerate(props):
+            min_r, min_c, max_r, max_c = region.bbox
+            # CNNパッチ
+            for t_idx, base_img in enumerate(tile_cnn_base):
+                patch = base_img[min_r:max_r, min_c:max_c]
+                if patch.shape[0]<2 or patch.shape[1]<2: pr = np.zeros((UPSCALE_SIZE, UPSCALE_SIZE, 3))
+                else: pr = resize(patch, (UPSCALE_SIZE, UPSCALE_SIZE), preserve_range=True)
+                cnn_batches[t_idx].append(preprocess_input(pr))
+            seg_indices.append(i)
+            
+            # 数値特徴
+            r_idx, c_idx = region.coords[:,0], region.coords[:,1]
+            ts_means = []
+            feat_vec = []
+            meta_row = {'Global_ID': global_segment_id_counter + region.label, 'Tile_Row': r_off, 'Tile_Col': c_off, 'Local_ID': region.label}
+            
+            # 面積
+            area_ha = (region.area * 100) / 10000.0
+            meta_row['Area_ha'] = round(area_ha, 3)
+            
+            for t_idx, t_data in enumerate(tile_loaded):
+                t_mean = {}
+                for b in (TARGET_BANDS_S2 + TARGET_BANDS_S1):
+                    if b in t_data: t_mean[b] = np.mean(t_data[b][r_idx, c_idx])
+                    else: t_mean[b] = 0.0
+                ts_means.append(t_mean)
+                
+                f_list, f_dict = calc_all_indices_dict(t_mean)
+                # ★B12追加
+                feat_vec.extend([t_mean.get("B08",0), t_mean.get("B11",0), t_mean.get("B12",0), t_mean.get("VH",0)])
+                feat_vec.extend(f_list)
+                
+                # CSV記録
+                m_pre = f"T{t_idx+1}"
+                for k,v in f_dict.items(): meta_row[f"{m_pre}_{k}"] = round(float(v),4)
+                meta_row[f"{m_pre}_B12"] = round(float(t_mean.get("B12",0)),4)
+            
+            hyst_area, hyst_lag = calc_bio_structural_hysteresis(ts_means)
+            feat_vec.extend([hyst_area, hyst_lag])
+            meta_row['Hysteresis_Area'] = round(hyst_area, 4)
+            
+            all_segment_features.append(feat_vec) # 数値のみ一旦保存
+            all_segment_meta.append(meta_row)
+            
+            # 重心座標 (教師データマッチング用)
+            cy, cx = region.centroid
+            gx, gy = win_transform * (cx, cy)
+            all_segment_geoms.append(Point(gx, gy))
+
+        # CNN推論 (バッチ)
+        temp_cnn_feats = [[] for _ in range(len(ts_paths_list))]
+        for t_idx, batch_imgs in enumerate(cnn_batches):
+            if not batch_imgs: continue
+            preds = inception.predict(np.array(batch_imgs), batch_size=BATCH_SIZE_CNN, verbose=0)
+            temp_cnn_feats[t_idx] = preds
+            
+        # 結合して保存
+        current_cnn_combined = []
+        for i in range(len(seg_indices)):
+            stacked = np.concatenate([temp_cnn_feats[t][i] for t in range(len(ts_paths_list))])
+            # 直近に追加された all_segment_features[-(len-i)] と結合したいが
+            # メモリ効率のため、ここでは all_segment_features を上書き更新する
+            num_idx = len(all_segment_features) - len(seg_indices) + i
+            num_feat = all_segment_features[num_idx]
+            combined = np.concatenate([stacked, np.array(num_feat)])
+            all_segment_features[num_idx] = combined # 上書き
+            
+        global_segment_id_counter += (segments.max() + 1000) # ID重複回避のため飛ばす
+
+print("\n3. 全特徴量抽出完了。学習開始...")
+
+# --- 3. 学習 ---
+X_all = np.array(all_segment_features)
+target_col = next((c for c in ['class_id', 'macroclass_id', 'C_ID'] if c in gdf_raw.columns), gdf_raw.columns[0])
+
+X_train, y_train = [], []
+train_indices = set()
+
+# 空間検索 (Point in Polygon は重いので、教師データの近くのセグメントを探す)
+# セグメント重心のリストを作ったので、教師データごとに最短距離のセグメントを探す
+# (30kmだと教師点数も多いので、KDTree推奨だが、ここでは全探索ループは避ける)
+
+# 簡易実装: 教師データの座標を持つDataFrame作成
+df_segs = pd.DataFrame({'geom': all_segment_geoms, 'idx': range(len(all_segment_geoms))})
+gdf_segs = gpd.GeoDataFrame(df_segs, geometry='geom', crs=main_crs)
+
+# 教師データとの結合
+gdf_teacher_points = gdf_raw.copy()
+gdf_teacher_points['geometry'] = gdf_teacher_points.geometry.centroid
+# 空間結合 (nearest)
+joined = gpd.sjoin_nearest(gdf_teacher_points, gdf_segs, distance_col="dist")
+# 距離が近すぎる(例えば20m以内)ものだけ採用
+valid_train = joined[joined['dist'] < 20.0]
+
+for _, row in valid_train.iterrows():
+    f_idx = int(row['idx'])
+    if f_idx not in train_indices:
+        X_train.append(X_all[f_idx])
+        y_train.append(int(row[target_col]))
+        train_indices.add(f_idx)
+
+X_train = np.array(X_train); y_train = np.array(y_train)
+
+if len(y_train) == 0: raise ValueError("学習データなし")
+
+print(f"   学習データ数: {len(y_train)}")
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+svm = SVC(kernel='rbf', C=10.0, class_weight='balanced', probability=False)
+svm.fit(X_train_scaled, y_train)
+
+# --- 4. 全推論 & 結果保存 (CSV) ---
+print("4. 全域推論 & CSV出力...")
+X_all_scaled = scaler.transform(X_all)
+preds = svm.predict(X_all_scaled)
+
+csv_rows = []
+# Global ID -> Pred Label のマップ
+global_id_pred_map = {}
+
+for i, item in enumerate(all_segment_meta):
+    pred_label = preds[i]
+    class_name = CLASS_NAMES.get(pred_label, f"Class_{pred_label}")
+    row = item.copy()
+    row['Final_Class'] = class_name
+    # 不要列削除
+    del row['Global_ID']; del row['Tile_Row']; del row['Tile_Col']; del row['Local_ID']
+    csv_rows.append(row)
+    
+    # マップ構築用
+    gid = item['Global_ID']
+    global_id_pred_map[gid] = pred_label
+
+# CSV保存
+df_result = pd.DataFrame(csv_rows)
+# カラム整理
+cols = ['Plot_ID', 'Final_Class', 'Area_ha', 'Hysteresis_Area'] + [c for c in df_result.columns if c not in ['Plot_ID', 'Final_Class', 'Area_ha', 'Hysteresis_Area']]
+df_result = df_result[cols]
+df_result.to_csv(OUTPUT_TABLE, index=False, encoding='utf-8-sig')
+
+# サマリー
+summary_dfs = []
+target_cols = [c for c in df_result.columns if "T4_NDVI" in c or "Hysteresis" in c or "VH" in c]
+for cls_name, group in df_result.groupby("Final_Class"):
+    if target_cols:
+        desc = group[target_cols].describe().T[['min', 'mean', 'max']]
+        desc['Class'] = cls_name
+        summary_dfs.append(desc)
+if summary_dfs:
+    pd.concat(summary_dfs).to_csv(OUTPUT_SUMMARY, encoding='utf-8-sig')
+
+# --- 5. マップ再構築 (Re-Tiling) ---
+print("5. 地図再構築 (Map Reconstruction)...")
+# 結果を書き込むために、もう一度タイル処理を行う（メモリ節約のため）
+# ただし今回は画像ロードは最小限(メイン画像のみ)で、SLICだけ再実行してIDを照合する
+
+# タイル処理の再現性確保のため、パラメータは厳密に同じにする
+# ※本来はStep2でセグメント画像を一時保存するのが確実だが、ここでは再計算で行く
+# グローバルIDカウンターのリセット
+global_segment_id_counter_map = 0
+
+out_profile = src_main.profile.copy()
+out_profile.update(height=full_h, width=full_w, transform=rasterio.windows.transform(full_window, main_transform), count=1, dtype=rasterio.uint8)
+
+with rasterio.open(OUTPUT_MAP, 'w', **out_profile) as dst:
+    for r_off in range(0, full_h, TILE_SIZE):
+        for c_off in range(0, full_w, TILE_SIZE):
+            width = min(TILE_SIZE, full_w - c_off); height = min(TILE_SIZE, full_h - r_off)
+            abs_col = full_window.col_off + c_off; abs_row = full_window.row_off + r_off
+            win = Window(abs_col, abs_row, width, height)
+            
+            # メイン画像のみロード
+            with rasterio.open(main_paths["B08"]) as src:
+                 with WarpedVRT(src, crs=main_crs, transform=main_transform, width=main_width, height=main_height) as vrt:
+                    b8 = vrt.read(1, window=win, out_shape=(height, width), resampling=Resampling.bilinear)
+            
+            # パス辞書からB04, B03を探す (main_paths内)
+            # 簡易的に同じフォルダと仮定
+            # (厳密には再ロードが必要だが、コード長くなるので省略せず書く)
+            # Step2と同じロジックで画像を作る
+            try:
+                # ここではメイン画像のパスからディレクトリを取ってB04, B03を読む
+                d_path = os.path.dirname(main_paths["B08"])
+                with rasterio.open(glob.glob(os.path.join(d_path, "*B04*.tif"))[0]) as s4:
+                     with WarpedVRT(s4, crs=main_crs, transform=main_transform, width=main_width, height=main_height) as vrt:
+                        b4 = vrt.read(1, window=win, out_shape=(height, width), resampling=Resampling.bilinear)
+                with rasterio.open(glob.glob(os.path.join(d_path, "*B03*.tif"))[0]) as s3:
+                     with WarpedVRT(s3, crs=main_crs, transform=main_transform, width=main_width, height=main_height) as vrt:
+                        b3 = vrt.read(1, window=win, out_shape=(height, width), resampling=Resampling.bilinear)
+                
+                seg_img = np.dstack([b8, b4, b3])
+                img_norm = np.clip(seg_img / MAX_PIXEL_VALUE, 0, 1)
+                segments = slic(img_norm, n_segments=APPROX_N_SEGMENTS_PER_TILE, compactness=SEGMENT_COMPACTNESS, start_label=1)
+                
+                # ID置換
+                tile_map = np.zeros((height, width), dtype=np.uint8)
+                # このタイルのセグメントIDに global_counter を足して辞書検索
+                # ※SLICは決定的アルゴリズムだが、浮動小数点演算の誤差で微妙に変わるリスクはある
+                # 安全策: propsを回してIDを取得
+                
+                unique_labels = np.unique(segments)
+                for loc_id in unique_labels:
+                    if loc_id == 0: continue
+                    gid = global_segment_id_counter_map + loc_id
+                    pred = global_id_pred_map.get(gid, 0) # 未登録なら0(背景)
+                    tile_map[segments == loc_id] = pred
+                
+                # 書き込み
+                dst.write(tile_map, 1, window=Window(c_off, r_off, width, height))
+                
+            except Exception as e:
+                print(f"Map Write Error at {r_off},{c_off}: {e}")
+            
+            global_segment_id_counter_map += (segments.max() + 1000)
+
+print(f"=== 全工程完了 ===")
+print(f"地図: {OUTPUT_MAP}")
+print(f"台帳: {OUTPUT_TABLE}")
+print(f"基準: {OUTPUT_SUMMARY}")
